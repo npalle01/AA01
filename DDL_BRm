@@ -1,0 +1,164 @@
+------------------------------------------------------------------------
+-- 1. BRM_RULE_TYPES
+------------------------------------------------------------------------
+CREATE MULTISET TABLE BRM_RULE_TYPES (
+    RULE_TYPE_ID   INTEGER NOT NULL,
+    RULE_TYPE_NAME VARCHAR(100) NOT NULL,
+    -- Primary Key
+    PRIMARY KEY (RULE_TYPE_ID),
+    -- For unique name
+    UNIQUE (RULE_TYPE_NAME)
+)
+;
+
+------------------------------------------------------------------------
+-- 2. BUSINESS_GROUPS
+------------------------------------------------------------------------
+CREATE MULTISET TABLE BUSINESS_GROUPS (
+    GROUP_NAME  VARCHAR(100) NOT NULL,
+    DESCRIPTION VARCHAR(255),
+    EMAIL       VARCHAR(255),
+    PRIMARY KEY (GROUP_NAME)
+)
+;
+
+------------------------------------------------------------------------
+-- 3. USERS
+------------------------------------------------------------------------
+CREATE MULTISET TABLE USERS (
+    USER_ID    INTEGER GENERATED ALWAYS AS IDENTITY
+                  (START WITH 1 INCREMENT BY 1)
+               NOT NULL,
+    USERNAME   VARCHAR(100) NOT NULL,
+    PASSWORD   VARCHAR(100) NOT NULL,
+    USER_GROUP VARCHAR(100) NOT NULL,
+    PRIMARY KEY (USER_ID),
+    UNIQUE (USERNAME)
+)
+;
+
+------------------------------------------------------------------------
+-- 4. GROUP_PERMISSIONS
+------------------------------------------------------------------------
+CREATE MULTISET TABLE GROUP_PERMISSIONS (
+    GROUP_NAME   VARCHAR(100) NOT NULL,
+    TARGET_TABLE VARCHAR(100) NOT NULL,
+    PRIMARY KEY (GROUP_NAME, TARGET_TABLE)
+)
+;
+
+------------------------------------------------------------------------
+-- 5. BRM_RULES
+------------------------------------------------------------------------
+CREATE MULTISET TABLE BRM_RULES (
+    RULE_ID                INTEGER GENERATED ALWAYS AS IDENTITY
+                             (START WITH 1 INCREMENT BY 1)
+                          NOT NULL,
+    PARENT_RULE_ID         INTEGER,
+    RULE_TYPE_ID           INTEGER NOT NULL,
+    RULE_NAME              VARCHAR(200) NOT NULL,
+    -- For large SQL, consider CLOB or a suitably large VARCHAR
+    RULE_SQL               CLOB(1048576)
+       CHARACTER SET UNICODE NOT CASESPECIFIC,
+    EFFECTIVE_START_DATE   VARCHAR(25) NOT NULL,
+    EFFECTIVE_END_DATE     VARCHAR(25),
+    STATUS                 VARCHAR(8) NOT NULL,      -- e.g. 'ACTIVE'/'INACTIVE'
+    VERSION                INTEGER NOT NULL DEFAULT 1,
+    CREATED_BY             VARCHAR(100) NOT NULL,
+    DESCRIPTION            VARCHAR(2000),
+    OPERATION_TYPE         VARCHAR(50),
+    BUSINESS_JUSTIFICATION VARCHAR(2000),
+    CREATED_TIMESTAMP      TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP(0),
+    UPDATED_BY             VARCHAR(100),
+    OWNER_GROUP            VARCHAR(100) NOT NULL,
+    PRIMARY KEY (RULE_ID),
+    -- Foreign key references (no cascading here by default)
+    FOREIGN KEY (RULE_TYPE_ID) REFERENCES BRM_RULE_TYPES (RULE_TYPE_ID),
+    FOREIGN KEY (PARENT_RULE_ID) REFERENCES BRM_RULES (RULE_ID)
+)
+;
+
+------------------------------------------------------------------------
+-- 6. BRM_RULE_TABLE_DEPENDENCIES
+------------------------------------------------------------------------
+CREATE MULTISET TABLE BRM_RULE_TABLE_DEPENDENCIES (
+    DEPENDENCY_ID  INTEGER GENERATED ALWAYS AS IDENTITY
+                      (START WITH 1 INCREMENT BY 1)
+                   NOT NULL,
+    RULE_ID        INTEGER NOT NULL,
+    DATABASE_NAME  VARCHAR(100) NOT NULL,
+    TABLE_NAME     VARCHAR(100) NOT NULL,
+    PRIMARY KEY (DEPENDENCY_ID),
+    FOREIGN KEY (RULE_ID) REFERENCES BRM_RULES (RULE_ID)
+)
+;
+
+------------------------------------------------------------------------
+-- 7. BRM_AUDIT_LOG
+------------------------------------------------------------------------
+CREATE MULTISET TABLE BRM_AUDIT_LOG (
+    AUDIT_ID        INTEGER GENERATED ALWAYS AS IDENTITY
+                      (START WITH 1 INCREMENT BY 1)
+                    NOT NULL,
+    ACTION          VARCHAR(100) NOT NULL,
+    TABLE_NAME      VARCHAR(100) NOT NULL,
+    RECORD_ID       VARCHAR(100) NOT NULL,
+    ACTION_BY       VARCHAR(100) NOT NULL,
+    OLD_DATA        CLOB(1048576) CHARACTER SET UNICODE,
+    NEW_DATA        CLOB(1048576) CHARACTER SET UNICODE,
+    ACTION_TIMESTAMP TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP(0),
+    PRIMARY KEY (AUDIT_ID)
+)
+;
+
+------------------------------------------------------------------------
+-- 8. BRM_COLUMN_MAPPING
+------------------------------------------------------------------------
+CREATE MULTISET TABLE BRM_COLUMN_MAPPING (
+    MAPPING_ID           INTEGER GENERATED ALWAYS AS IDENTITY
+                           (START WITH 1 INCREMENT BY 1)
+                         NOT NULL,
+    RULE_ID              INTEGER NOT NULL,
+    SOURCE_TABLE         VARCHAR(100) NOT NULL,
+    SOURCE_COLUMN        VARCHAR(100) NOT NULL,
+    TARGET_TABLE         VARCHAR(100) NOT NULL,
+    TARGET_COLUMN        VARCHAR(100) NOT NULL,
+    BUSINESS_COLUMN_NAME VARCHAR(255),
+    COLUMN_DESCRIPTION   VARCHAR(255),
+    PRIMARY KEY (MAPPING_ID),
+    FOREIGN KEY (RULE_ID) REFERENCES BRM_RULES (RULE_ID)
+)
+;
+
+------------------------------------------------------------------------
+-- 9. BRM_RULE_LINEAGE
+------------------------------------------------------------------------
+CREATE MULTISET TABLE BRM_RULE_LINEAGE (
+    LINEAGE_ID           INTEGER GENERATED ALWAYS AS IDENTITY
+                           (START WITH 1 INCREMENT BY 1)
+                         NOT NULL,
+    RULE_ID              INTEGER NOT NULL,
+    SOURCE_INFO          CLOB(1048576) CHARACTER SET UNICODE,
+    TARGET_INFO          CLOB(1048576) CHARACTER SET UNICODE,
+    TRANSFORMATION_DETAILS CLOB(1048576) CHARACTER SET UNICODE,
+    CREATED_TIMESTAMP    TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP(0),
+    PRIMARY KEY (LINEAGE_ID),
+    FOREIGN KEY (RULE_ID) REFERENCES BRM_RULES (RULE_ID)
+)
+;
+
+------------------------------------------------------------------------
+-- 10. BRM_GROUP_BACKUPS
+------------------------------------------------------------------------
+CREATE MULTISET TABLE BRM_GROUP_BACKUPS (
+    BACKUP_ID        INTEGER GENERATED ALWAYS AS IDENTITY
+                       (START WITH 1 INCREMENT BY 1)
+                     NOT NULL,
+    GROUP_NAME       VARCHAR(100) NOT NULL,
+    BACKUP_TIMESTAMP TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP(0),
+    BACKUP_VERSION   INTEGER NOT NULL,
+    BACKUP_JSON      CLOB(1048576)
+       CHARACTER SET UNICODE NOT CASESPECIFIC,
+    PRIMARY KEY (BACKUP_ID)
+)
+;
