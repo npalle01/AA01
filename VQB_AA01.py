@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
-# truly_production_ready_vqb_merged.py
+# truly_production_ready_vqb_enhanced.py
 #
-# A single-file Python/PyQt advanced Visual Query Builder for Teradata, merging:
+# A single-file Python/PyQt advanced Visual Query Builder for Teradata, featuring:
 #  - ODBC connection
-#  - Lazy schema (DB->Tables->Columns) with drag table to canvas
-#  - BFS multi-join subgraphs + auto-FK lines from DBC.All_RI_Children
-#  - SubVQBDialog for a second (sub) VQB to combine with main
-#  - DML mapping lines (INSERT/UPDATE/DELETE) with a red line division
+#  - Lazy schema with DB->Tables->Columns in a QTree
+#  - Drag tables to a canvas (auto-FK detection & BFS multi-join)
+#  - DML mapping lines (INSERT/UPDATE/DELETE) with a red partition line
 #  - Pivot wizard, window function wizard
-#  - Advanced expression builder (token-based)
-#  - Nested subquery item on the canvas
-#  - Toggle auto-generate vs. manual edits
-#  - Minimal typed column checks for DML
-#  - Polished UI/UX with narrower radio/checkbox spacing
-#  - Run SQL (stub or mini preview)
-#
+#  - Advanced expression builder (now with a "SubQuery" token)
+#  - **Nested subquery item** that uses a **full VQB** instead of manual text
+#  - SubVQBDialog for combining queries (UNION, etc.)
+#  - Toggle auto-generate vs. manual SQL
+#  - Single-file demonstration
 
 import sys
 import traceback
@@ -51,11 +48,10 @@ logging.basicConfig(
     level=logging.DEBUG
 )
 pyodbc.pooling = True
-
 GRID_SIZE = 20
 
 ###############################################################################
-# 1) Apply Fusion Style + narrower spacing for checkboxes/radio
+# 1) Apply Fusion Style (narrower checkboxes/radio)
 ###############################################################################
 def apply_fusion_style():
     """Applies a 'Fusion' style and sets narrower checkbox/radio indicators."""
@@ -156,7 +152,7 @@ class ODBCConnectDialog(QDialog):
         return self._db_type
 
 ###############################################################################
-# 3) Lazy schema loader
+# 3) Lazy schema loading
 ###############################################################################
 class LazySchemaLoaderWorkerSignals(QObject):
     finished = pyqtSignal(list)
@@ -213,7 +209,6 @@ def load_foreign_keys(connection):
             pd = row.ParentDatabaseName.strip()
             pt = row.ParentTableName.strip()
             pc = row.ParentKeyColumnName.strip()
-
             child_key = f"{cd}.{ct}.{cc}"
             parent_key= f"{pd}.{pt}.{pc}"
             fk_map[child_key] = parent_key
@@ -359,7 +354,7 @@ class LazySchemaTreeWidget(QTreeWidget):
             drag.exec_(actions)
 
 ###############################################################################
-# 6) FullSQLParser & SyntaxHighlighter
+# 6) SQL Parsing & Highlighting
 ###############################################################################
 class FullSQLParser:
     """Uses sqlparse to validate there's at least one statement."""
@@ -412,7 +407,7 @@ class SQLHighlighter(QSyntaxHighlighter):
         self.setCurrentBlockState(0)
 
 ###############################################################################
-# 7) MappingLine, JoinLine, NestedSubqueryItem
+# 7) MappingLine, JoinLine
 ###############################################################################
 class MappingLine(QGraphicsLineItem):
     """Used to map source columns to target columns for DML. Painted in red."""
@@ -480,8 +475,38 @@ class JoinLine(QGraphicsLineItem):
         self.update_line()
         super().hoverLeaveEvent(e)
 
+###############################################################################
+# 8) NestedSubqueryItem that uses a Full VQB
+###############################################################################
+class NestedVQBDialog(QDialog):
+    """
+    A full VQB in a dialog, used specifically for Nested SubQuery items.
+    """
+    def __init__(self, existing_sql="", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Nested SubVQB")
+        self.resize(900,600)
+        self.vqb_tab = None
+        self.existing_sql = existing_sql
+
+        # Build the layout
+        layout = QVBoxLayout(self)
+        self.vqb_tab = VisualQueryBuilderTab()
+        layout.addWidget(self.vqb_tab)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+        self.setLayout(layout)
+
+        # Optionally, parse existing_sql if you want.  For now, we just show an empty builder.
+
+    def get_built_sql(self):
+        return self.vqb_tab.sql_display.toPlainText().strip()
+
 class NestedSubqueryItem(QGraphicsRectItem):
-    """Rect representing a nested subquery on the canvas, double-click to edit."""
+    """Rect representing a nested subquery on the canvas, double-click to open a full sub-VQB."""
     def __init__(self, x=0,y=0):
         super().__init__(0,0,220,80)
         self.setPos(x,y)
@@ -495,36 +520,23 @@ class NestedSubqueryItem(QGraphicsRectItem):
         self.label.setFont(f)
 
     def mouseDoubleClickEvent(self, event):
-        d=QDialog()
-        d.setWindowTitle("Edit Nested SubQuery")
-        lay=QVBoxLayout(d)
-        lab=QLabel("Enter or build subquery:")
-        lay.addWidget(lab)
-        txt=QTextEdit()
-        txt.setPlainText(self.query_text)
-        lay.addWidget(txt)
-
-        btns=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
-        lay.addWidget(btns)
-        def on_ok():
-            self.query_text=txt.toPlainText()
-            self.label.setPlainText("Nested SubQuery\n(edited)")
-            d.accept()
-        btns.accepted.connect(on_ok)
-        btns.rejected.connect(d.reject)
-
-        d.setLayout(lay)
-        d.exec_()
+        # open a full nested VQB dialog
+        dlg = NestedVQBDialog(existing_sql=self.query_text)
+        if dlg.exec_() == QDialog.Accepted:
+            new_sql = dlg.get_built_sql()
+            if new_sql:
+                self.query_text = new_sql
+                self.label.setPlainText("Nested SubQuery\n(VQB built)")
         event.accept()
 
     def get_sql(self):
         return self.query_text
 
 ###############################################################################
-# 8) WindowFunctionDialog & ExpressionBuilderDialog
+# 9) WindowFunctionDialog & ExpressionBuilder with a "SubQuery" button
 ###############################################################################
 class WindowFunctionDialog(QDialog):
-    """Minimal wizard for window function. We limit freehand text for frame clause."""
+    """Minimal wizard for window function."""
     def __init__(self, available_cols, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Window Function Wizard")
@@ -601,7 +613,7 @@ class WindowFunctionDialog(QDialog):
         return f"{self.function}(){over} AS {self.alias}"
 
 class AdvancedExpressionBuilderDialog(QDialog):
-    """Token-based expression builder with minimal freehand."""
+    """Token-based expression builder with minimal freehand + subquery token."""
     def __init__(self, available_columns, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Advanced Expression Builder")
@@ -627,7 +639,7 @@ class AdvancedExpressionBuilderDialog(QDialog):
         token_h.addWidget(col_btn)
 
         self.op_combo=QComboBox()
-        self.op_combo.addItems(["+","-","*","/","=","<",">","<=",">=","<>"])
+        self.op_combo.addItems(["+","-","*","/","=","<",">","<=",">=","<>","AND","OR","LIKE"])
         op_btn=QPushButton("Op")
         op_btn.clicked.connect(self.add_op_token)
         token_h.addWidget(self.op_combo)
@@ -646,6 +658,11 @@ class AdvancedExpressionBuilderDialog(QDialog):
         paren_r.clicked.connect(lambda: self.add_token(")"))
         token_h.addWidget(paren_l)
         token_h.addWidget(paren_r)
+
+        # Add a "SubQuery" token
+        subq_btn=QPushButton("SubQuery")
+        subq_btn.clicked.connect(self.add_subquery_token)
+        token_h.addWidget(subq_btn)
 
         undo_btn=QPushButton("Undo")
         undo_btn.clicked.connect(self.remove_last_token)
@@ -679,6 +696,16 @@ class AdvancedExpressionBuilderDialog(QDialog):
         if fn:
             self.add_token(fn)
 
+    def add_subquery_token(self):
+        """Open a full sub-VQB and insert it as (subquery)."""
+        dlg = SubVQBDialog()  # or we can create a specialized NestedVQBDialog
+        if dlg.exec_() == QDialog.Accepted:
+            op, second_sql = dlg.getResult()
+            # SubVQBDialog always returns an operator and the built SQL. We can ignore operator here.
+            if second_sql:
+                token_str = f"({second_sql})"
+                self.add_token(token_str)
+
     def add_token(self, token):
         self.expression_tokens.append(token)
         self.refresh_preview()
@@ -707,7 +734,7 @@ class AdvancedExpressionBuilderDialog(QDialog):
         return (self.alias,expr)
 
 ###############################################################################
-# 9) FilterPanel, PivotDialog, GroupByPanel, SortLimitPanel
+# 10) FilterPanel, PivotDialog, GroupByPanel, SortLimitPanel
 ###############################################################################
 class AddFilterDialog(QDialog):
     """Dialog to add a single filter condition."""
@@ -1137,7 +1164,7 @@ class SortLimitPanel(QGroupBox):
         return val if val>0 else None
 
 ###############################################################################
-# 10) SQLImportTab
+# 11) SQLImportTab
 ###############################################################################
 class SQLImportTab(QWidget):
     """Allows user to paste SQL and run a parse check."""
@@ -1170,7 +1197,7 @@ class SQLImportTab(QWidget):
             QMessageBox.warning(self,"Import Error",f"Parsing error: {e}")
 
 ###############################################################################
-# 11) EnhancedCanvasGraphicsView
+# 12) EnhancedCanvas
 ###############################################################################
 class EnhancedCanvasGraphicsView(QGraphicsView):
     """Main canvas for table items, subqueries, join lines, DML mapping lines, etc."""
@@ -1182,7 +1209,7 @@ class EnhancedCanvasGraphicsView(QGraphicsView):
         self.setRenderHint(QtGui.QPainter.Antialiasing)
         self.setDragMode(QGraphicsView.RubberBandDrag)
 
-        self.table_items={}   # e.g. { "db.tbl": QGraphicsRectItem }
+        self.table_items={}   # e.g. { "db.tbl": QGraphicsRectItem or NestedSubqueryItem }
         self.join_lines=[]
         self.mapping_lines=[]
 
@@ -1274,7 +1301,7 @@ class EnhancedCanvasGraphicsView(QGraphicsView):
             jl.update_line()
 
 ###############################################################################
-# 12) SubVQBDialog (for a second full VQB to combine queries)
+# 13) SubVQBDialog (reuse for combining queries or expression builder subquery)
 ###############################################################################
 class SubVQBDialog(QDialog):
     """
@@ -1298,7 +1325,7 @@ class SubVQBDialog(QDialog):
         op_layout.addStretch()
         layout.addLayout(op_layout)
 
-        # We can reuse a second VisualQueryBuilderTab
+        # Use a second VisualQueryBuilderTab
         from_tab=VisualQueryBuilderTab()
         self.sub_vqb=from_tab
         layout.addWidget(from_tab)
@@ -1322,7 +1349,7 @@ class SubVQBDialog(QDialog):
         return (self.operator,self.second_sql)
 
 ###############################################################################
-# 13) The core VisualQueryBuilderTab
+# 14) The main VisualQueryBuilderTab
 ###############################################################################
 class VisualQueryBuilderTab(QWidget):
     """Manages the schema/canvas, filter, group, sort, plus final SQL generation."""
@@ -1562,6 +1589,7 @@ class VisualQueryBuilderTab(QWidget):
             self.generate_sql()
 
     def combine_with_subvqb(self):
+        """Combine query button that opens SubVQBDialog to build second query."""
         subdlg=SubVQBDialog(parent_vqb=self, parent=self)
         if subdlg.exec_()==QDialog.Accepted:
             op, second_sql=subdlg.getResult()
@@ -1592,7 +1620,7 @@ class VisualQueryBuilderTab(QWidget):
             self.validate_sql()
 
     def handle_drop(self, full_name, pos):
-        # If not loaded yet, load a placeholder set of columns
+        """When a user drags a table from schema to canvas."""
         if full_name not in self.table_columns_map:
             self.table_columns_map[full_name]=["id","col1","col2"]
         cols=self.table_columns_map[full_name]
@@ -1670,10 +1698,10 @@ class VisualQueryBuilderTab(QWidget):
             self.canvas.remove_mapping_lines()
             return
 
-        # Otherwise, add a vertical red line + placeholders for demonstration
+        # Otherwise, add a vertical red line + placeholders
         self.canvas.add_vertical_red_line(450)
 
-        # Create "complete query item" on the left
+        # Create "complete query item" on the left if missing
         if not self.canvas.complete_query_item:
             rect=QGraphicsRectItem(0,0,200,80)
             rect.setBrush(QBrush(QColor(250,250,180)))
@@ -1689,7 +1717,7 @@ class VisualQueryBuilderTab(QWidget):
             self.canvas.scene_.addItem(rect)
             self.canvas.complete_query_item=rect
 
-        # Create "target table item" on the right
+        # Create "target table item" on the right if missing
         if not self.canvas.target_table_item:
             rect2=QGraphicsRectItem(0,0,200,100)
             rect2.setBrush(QBrush(QColor(220,220,255)))
@@ -1770,8 +1798,7 @@ class VisualQueryBuilderTab(QWidget):
                 if not blocks:
                     blocks.append("FROM "+block)
                 else:
-                    # if disconnected subgraph, you'd do multiple FROM, or
-                    # apply your own logic. We'll just comment it out for clarity:
+                    # if disconnected subgraph => multiple FROM segments
                     blocks.append("-- Another subgraph:\nFROM "+block)
         return "\n".join(blocks) if blocks else "-- no tables on canvas"
 
@@ -1853,7 +1880,6 @@ class VisualQueryBuilderTab(QWidget):
         if not mapped:
             return "-- No column mapping => no INSERT"
 
-        # We'll build subSelect as a normal SELECT
         subSelect=self._generate_select_sql_only()
 
         target_cols=[]
@@ -1877,7 +1903,7 @@ class VisualQueryBuilderTab(QWidget):
             return "-- No column mapping => no UPDATE"
 
         subSelect=self._generate_select_sql_only()
-        # naive approach: assume last col in mapped is key col
+        # assume last col is key
         key_col="key"
         sets=[]
         for (src,tgt) in mapped:
@@ -1908,29 +1934,27 @@ class VisualQueryBuilderTab(QWidget):
         return "\n".join(lines)
 
     def _generate_select_sql_only(self):
-        """Generate a plain SELECT for use inside DML (INSERT..SELECT, etc.)."""
+        """Generate a plain SELECT for subSelect usage in DML."""
         scols=self.get_selected_columns()
         if not scols:
             scols=["*"]
         lines=[]
         lines.append("SELECT "+", ".join(scols))
         lines.append(self._build_bfs_from())
-
         wfs=self.filter_panel.get_filters("WHERE")
         if wfs:
             conds=[f"{x[0]} {x[1]} {x[2]}" for x in wfs]
             lines.append("WHERE "+ " AND ".join(conds))
-
-        # We won't apply group-by/having here for the subSelect, but you can adapt.
+        # Not applying group/having in the subSelect for brevity
         return "\n".join(lines)
 
 ###############################################################################
-# 14) MainVQBWindow
+# 15) MainVQBWindow
 ###############################################################################
 class MainVQBWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Merged Visual Query Builder - Single File")
+        self.setWindowTitle("Enhanced Visual Query Builder - Single File")
         self.resize(1200,800)
 
         self.builder_tab=VisualQueryBuilderTab()
@@ -1948,7 +1972,7 @@ class MainVQBWindow(QMainWindow):
         layout_act.triggered.connect(self.on_auto_layout)
         tb.addAction(layout_act)
 
-        # Example for demonstration: create a quick mapping line
+        # Example: create a quick mapping line
         map_act=QAction("Demo Map (srcCol1->colA)", self)
         map_act.triggered.connect(self.demo_map)
         tb.addAction(map_act)
@@ -1958,7 +1982,7 @@ class MainVQBWindow(QMainWindow):
         self.builder_tab.canvas.fitInView(sc.itemsBoundingRect(),Qt.KeepAspectRatio)
 
     def on_auto_layout(self):
-        # Example: reposition tables in a grid
+        # Example: position tables in a grid
         items=list(self.builder_tab.canvas.table_items.values())
         col_count=3
         xsp=250
@@ -1974,7 +1998,7 @@ class MainVQBWindow(QMainWindow):
         """Connect 'srcCol1' in complete_query_item to 'colA' in target_table_item."""
         cv=self.builder_tab.canvas
         if (not cv.complete_query_item) or (not cv.target_table_item):
-            QMessageBox.information(self,"No DML placeholders","Please switch to INSERT/UPDATE/DELETE mode first.")
+            QMessageBox.information(self,"No DML placeholders","Switch to INSERT/UPDATE/DELETE mode first.")
             return
 
         left_txt=None
@@ -1992,11 +2016,10 @@ class MainVQBWindow(QMainWindow):
         if not left_txt or not right_txt:
             QMessageBox.information(self,"Not Found","srcCol1 or colA not found in placeholders.")
             return
-
         cv.create_mapping_line(left_txt, right_txt)
 
 ###############################################################################
-# 15) main()
+# main()
 ###############################################################################
 def main():
     app=QApplication(sys.argv)
