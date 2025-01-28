@@ -1,19 +1,5 @@
 #!/usr/bin/env python3
-# merged_vqb_cte_enhanced.py
-#
-# Demonstrates a single-file Python/PyQt Teradata Visual Query Builder with:
-#  - ODBC connection (Teradata DSN)
-#  - Lazy schema loading of DB->Tables->Columns
-#  - BFS multi-join with auto-FK detection from DBC.All_RI_Children
-#  - Collapsible table items on the canvas
-#  - Nested subqueries & sub-VQB for UNION, etc.
-#  - FilterPanel (WHERE/HAVING), GroupBy + pivot, SortLimit
-#  - Advanced expression builder + advanced window function wizard
-#  - Debounced dynamic SQL preview (SELECT/INSERT/UPDATE/DELETE)
-#  - Run SQL => fetch sample rows
-#  - NEW: Drag-to-Join “Column Matching”
-#  - NEW: **CTE Panel** for adding multiple WITH cteName AS (sub-VQB) ...
-#  - Single file, no external references
+# vqb_cte_enhanced_virtual_tables.py
 
 import sys
 import traceback
@@ -387,9 +373,6 @@ class SQLHighlighter(QSyntaxHighlighter):
 ################################################################################
 
 class ColumnJoinWizardDialog(QDialog):
-    """
-    Wizard that appears when user drags one column onto another column.
-    """
     def __init__(self, source_full, source_type, target_full, target_type, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Column Join Wizard")
@@ -525,22 +508,93 @@ class JoinLine(QGraphicsLineItem):
         super().hoverLeaveEvent(e)
 
 ################################################################################
-# 7) Collapsible BFS Source & Collapsible Table Items
+# 7) Collapsible Table Items
 ################################################################################
-class CollapsibleBFSGraphicsItem(QGraphicsRectItem):
+
+class DraggableColumnTextItem(QGraphicsTextItem):
     """
-    (Optional BFS item) code left in for reference.
+    A text item representing a single column for drag-based join or mapping.
     """
-    def __init__(self, item_title, bfs_columns, parent_builder, x=100, y=200):
-        super().__init__(0,0,240,40)
-        # ... omitted in full for brevity ...
-        pass
+    def __init__(self, parent_table_item, column_name, column_type):
+        super().__init__(column_name, parent_table_item)
+        self.parent_table_item = parent_table_item
+        self.column_name = column_name
+        self.column_type = column_type
+        self.setFlags(QGraphicsItem.ItemIsSelectable | QGraphicsItem.ItemIsFocusable)
+        # We still allow dropping, but only if the user does a drag from another column
+        self.setAcceptDrops(True)
+
+    def mousePressEvent(self, event):
+        if event.button()==Qt.LeftButton:
+            # start drag
+            drag = QtGui.QDrag(event.widget())
+            mime = QtCore.QMimeData()
+            full_col = f"{self.parent_table_item.table_fullname}.{self.column_name}"
+            mime.setText(f"{full_col}||{self.column_type}")
+            drag.setMimeData(mime)
+            drag.exec_(Qt.MoveAction)
+        else:
+            super().mousePressEvent(event)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasText() and "||" in event.mimeData().text():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        src_txt = event.mimeData().text()
+        if "||" not in src_txt:
+            event.ignore()
+            return
+        source_full, source_type = src_txt.split("||",1)
+        target_full = f"{self.parent_table_item.table_fullname}.{self.column_name}"
+        target_type = self.column_type
+
+        if source_full==target_full:
+            QMessageBox.information(None,"Same Column","Cannot join a column onto itself.")
+            event.ignore()
+            return
+
+        # only cross-table
+        if source_full.startswith(self.parent_table_item.table_fullname+"."):
+            QMessageBox.information(None,"Same Table","Join across different tables only.")
+            event.ignore()
+            return
+
+        dlg=ColumnJoinWizardDialog(source_full, source_type, target_full, target_type)
+        if dlg.exec_()==QDialog.Accepted:
+            jtype, cond=dlg.get_join_data()
+            builder = self.parent_table_item.parent_builder
+            cv = builder.canvas
+
+            sf_tab = ".".join(source_full.split(".")[:2])
+            tf_tab = ".".join(target_full.split(".")[:2])
+
+            source_item = cv.table_items.get(sf_tab,None)
+            target_item = cv.table_items.get(tf_tab,None)
+            if not source_item or not target_item:
+                QMessageBox.warning(None,"Join Error","Could not find table items for source/target.")
+                event.ignore()
+                return
+
+            jl=JoinLine(source_item, target_item, jtype, cond)
+            cv.scene_.addItem(jl)
+            cv.join_lines.append(jl)
+            jl.update_line()
+            QMessageBox.information(None,"Join Created",
+                f"Created {jtype} JOIN line:\n{cond}"
+            )
+            event.acceptProposedAction()
+        else:
+            event.ignore()
 
 class CollapsibleTableGraphicsItem(QGraphicsRectItem):
     """
-    A table item with:
-      - Title bar "db.tbl" + [X]
-      - Collapsible columns
+    A table item (or "virtual table" for a CTE) with columns that can be selected or joined.
     """
     def __init__(self, table_fullname, columns, parent_builder, x=0, y=0):
         super().__init__(0,0,220,40)
@@ -557,11 +611,11 @@ class CollapsibleTableGraphicsItem(QGraphicsRectItem):
         self.column_items=[]
 
         self.close_btn=QGraphicsTextItem("[X]", self)
-        self.close_btn.setPos(220-30,2)
+        self.close_btn.setPos(190,2)
         self.close_btn.setDefaultTextColor(Qt.red)
 
         self.toggle_btn=QGraphicsTextItem("[+]", self)
-        self.toggle_btn.setPos(220-55,2)
+        self.toggle_btn.setPos(170,2)
         self.toggle_btn.setDefaultTextColor(Qt.blue)
 
         f=QFont("Arial",9,QFont.Bold)
@@ -569,6 +623,7 @@ class CollapsibleTableGraphicsItem(QGraphicsRectItem):
         self.title_text.setFont(f)
         self.title_text.setPos(5,2)
 
+        # We'll guess the data types for each column
         self.mock_column_types = {}
         for c in columns:
             if c.lower().startswith("id") or c.lower().endswith("id"):
@@ -585,11 +640,12 @@ class CollapsibleTableGraphicsItem(QGraphicsRectItem):
             cText=DraggableColumnTextItem(self, c, self.mock_column_types[c])
             cText.setPos(20,yOff)
 
+            # default "not selected" => False
             self.column_items.append([cRect, cText, False])
             yOff+=20
 
         self.update_layout()
-        self.setAcceptDrops(True)
+        # We'll remove the .setAcceptDrops(True) so the background doesn't accept drops
 
     def update_layout(self):
         if self.is_collapsed:
@@ -623,10 +679,10 @@ class CollapsibleTableGraphicsItem(QGraphicsRectItem):
             event.accept()
             return
 
-        # check column toggles
         for i,(cRect,cText,checked) in enumerate(self.column_items):
             rRect=cRect.mapToParent(cRect.boundingRect()).boundingRect()
             if rRect.contains(pos):
+                # flip the check
                 self.column_items[i][2]=not checked
                 cRect.setBrush(QBrush(Qt.blue if self.column_items[i][2] else Qt.white))
                 if self.parent_builder.auto_generate:
@@ -638,7 +694,7 @@ class CollapsibleTableGraphicsItem(QGraphicsRectItem):
 
     def contextMenuEvent(self, event):
         menu=QMenu()
-        removeAction=menu.addAction("Remove Table")
+        removeAction=menu.addAction("Remove Table/CTE")
         chosen=menu.exec_(event.screenPos())
         if chosen==removeAction:
             sc=self.scene()
@@ -652,87 +708,6 @@ class CollapsibleTableGraphicsItem(QGraphicsRectItem):
                 colName=t.toPlainText().strip()
                 sel.append(f"{self.table_fullname}.{colName}")
         return sel
-
-    def dropEvent(self, event):
-        event.ignore()
-
-    def dragEnterEvent(self, event):
-        event.ignore()
-
-class DraggableColumnTextItem(QGraphicsTextItem):
-    def __init__(self, parent_table_item, column_name, column_type):
-        super().__init__(column_name, parent_table_item)
-        self.parent_table_item = parent_table_item
-        self.column_name = column_name
-        self.column_type = column_type
-        self.setFlags(QGraphicsItem.ItemIsSelectable | QGraphicsItem.ItemIsFocusable)
-        self.setAcceptDrops(True)
-
-    def mousePressEvent(self, event):
-        if event.button()==Qt.LeftButton:
-            drag = QtGui.QDrag(event.widget())
-            mime = QtCore.QMimeData()
-            full_col = f"{self.parent_table_item.table_fullname}.{self.column_name}"
-            mime.setText(f"{full_col}||{self.column_type}")
-            drag.setMimeData(mime)
-            drag.exec_(Qt.MoveAction)
-        else:
-            super().mousePressEvent(event)
-
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasText() and "||" in event.mimeData().text():
-            event.acceptProposedAction()
-        else:
-            event.ignore()
-
-    def dragMoveEvent(self, event):
-        event.acceptProposedAction()
-
-    def dropEvent(self, event):
-        src_txt = event.mimeData().text()
-        if "||" not in src_txt:
-            event.ignore()
-            return
-        source_full, source_type = src_txt.split("||",1)
-        target_full = f"{self.parent_table_item.table_fullname}.{self.column_name}"
-        target_type = self.column_type
-
-        if source_full==target_full:
-            QMessageBox.information(None,"Same Column","Cannot join a column onto itself.")
-            event.ignore()
-            return
-
-        if source_full.startswith(self.parent_table_item.table_fullname+"."):
-            QMessageBox.information(None,"Same Table","Join across different tables only.")
-            event.ignore()
-            return
-
-        dlg=ColumnJoinWizardDialog(source_full, source_type, target_full, target_type)
-        if dlg.exec_()==QDialog.Accepted:
-            jtype, cond=dlg.get_join_data()
-            builder = self.parent_table_item.parent_builder
-            cv = builder.canvas
-
-            sf_tab = ".".join(source_full.split(".")[:2])
-            tf_tab = ".".join(target_full.split(".")[:2])
-
-            source_item = cv.table_items.get(sf_tab,None)
-            target_item = cv.table_items.get(tf_tab,None)
-            if not source_item or not target_item:
-                QMessageBox.warning(None,"Join Error","Could not find table items for source/target.")
-                event.ignore()
-                return
-
-            jl=JoinLine(source_item, target_item, jtype, cond)
-            cv.scene_.addItem(jl)
-            cv.join_lines.append(jl)
-            jl.update_line()
-            QMessageBox.information(None,"Join Created",
-                f"Created {jtype} JOIN line:\n{cond}"
-            )
-            event.acceptProposedAction()
-        else:
-            event.ignore()
 
 ################################################################################
 # 8) Nested subqueries & sub-VQB
@@ -1539,7 +1514,8 @@ class SQLImportTab(QWidget):
         self.builder=builder
         layout=QVBoxLayout(self)
 
-        instruct=QLabel("Paste/type your SQL, then click 'Import' to parse.")
+        instruct=QLabel("Paste/type your SQL, then click 'Import' to parse.\n"
+                        "(Note: We do NOT reconstruct the canvas from this SQL.)")
         layout.addWidget(instruct)
 
         self.sql_edit=QTextEdit()
@@ -1559,12 +1535,13 @@ class SQLImportTab(QWidget):
         try:
             parser=FullSQLParser(raw)
             parser.parse()
-            QMessageBox.information(self,"Import OK","SQL parse succeeded.")
+            QMessageBox.information(self,"Import OK","SQL parse succeeded.\n\n"
+                                     "Note: The canvas is NOT updated from this imported SQL.")
         except Exception as e:
             QMessageBox.warning(self,"Import Error",f"Parsing error:\n{e}")
 
 ################################################################################
-# 14) (# NEW) CTE-related code
+# 14) (# NEW) The CTE Panel with "Virtual Table" Enhancement
 ################################################################################
 class CTEDialog(QDialog):
     """
@@ -1591,7 +1568,6 @@ class CTEDialog(QDialog):
             self.sub_vqb.set_connections(self.builder_ref.connections)
         layout.addWidget(self.sub_vqb)
 
-        # If there's existing SQL, put it into the sub-VQB's text display
         if self.cte_sql.strip():
             self.sub_vqb.sql_display.setPlainText(self.cte_sql)
 
@@ -1619,9 +1595,8 @@ class CTEDialog(QDialog):
 
 class CTEPanel(QGroupBox):
     """
-    Lets the user define multiple CTEs.
-    Each row in a table: [ CTE Name | Sub-VQB Button (unused) | SQL Preview ]
-    Internally stored as list of (cte_name, cte_sql).
+    Lets the user define multiple CTEs, each with a sub-VQB,
+    and also show them as "virtual tables" on the canvas.
     """
     def __init__(self, builder, parent=None):
         super().__init__("CTEs", parent)
@@ -1662,6 +1637,8 @@ class CTEPanel(QGroupBox):
             name, sql = dlg.get_cte_data()
             if name:
                 self._add_cte_row(name, sql)
+                # We'll create or update the virtual table for this new CTE
+                self.builder.show_cte_as_virtual_table(name, self._extract_columns_from_subvqb(dlg.sub_vqb))
                 if self.builder.auto_generate:
                     self.builder.generate_sql()
 
@@ -1681,14 +1658,25 @@ class CTEPanel(QGroupBox):
             self.cte_table.setItem(row_idx, 2, QTableWidgetItem(new_sql))
             self.cte_data[row_idx]['name'] = new_name
             self.cte_data[row_idx]['sql'] = new_sql
+
+            # remove old cte item on the canvas if the name changed
+            if new_name != current_name:
+                self.builder.remove_virtual_cte_table(current_name)
+
+            # re-add or update the virtual table
+            self.builder.show_cte_as_virtual_table(new_name, self._extract_columns_from_subvqb(dlg.sub_vqb))
             if self.builder.auto_generate:
                 self.builder.generate_sql()
 
     def on_remove_cte(self):
         rows = sorted([r.row() for r in self.cte_table.selectionModel().selectedRows()], reverse=True)
         for rr in rows:
+            nm = self.cte_table.item(rr,0).text()
             self.cte_table.removeRow(rr)
             del self.cte_data[rr]
+            # remove the cte from the canvas
+            self.builder.remove_virtual_cte_table(nm)
+
         if self.builder.auto_generate:
             self.builder.generate_sql()
 
@@ -1700,10 +1688,15 @@ class CTEPanel(QGroupBox):
         self.cte_table.setItem(row, 2, QTableWidgetItem(cte_sql))
         self.cte_data.append({'name': cte_name, 'sql': cte_sql})
 
+    def _extract_columns_from_subvqb(self, sub_vqb):
+        """
+        A naive approach: just ask sub_vqb for get_selected_columns().
+        If the user is building a SELECT with GroupBy or custom expressions,
+        we might not get a perfect list. It's demonstration only.
+        """
+        return sub_vqb.get_selected_columns()
+
     def get_ctes(self):
-        """
-        Return a list of (cteName, cteSQL).
-        """
         out = []
         for row in range(self.cte_table.rowCount()):
             n = self.cte_table.item(row, 0).text()
@@ -1712,19 +1705,20 @@ class CTEPanel(QGroupBox):
         return out
 
 ################################################################################
-# 15) EnhancedCanvasGraphicsView
+# 15) EnhancedCanvasGraphicsView (Remove Pan & Zoom)
 ################################################################################
 class EnhancedCanvasGraphicsView(QGraphicsView):
     """
-    The main drawing canvas.
+    The main drawing canvas. We removed the wheelEvent for zoom,
+    and removed setDragMode to disable pan/zoom.
     """
     def __init__(self, builder, parent=None):
         super().__init__(parent)
         self.builder=builder
         self.scene_ = QGraphicsScene(self)
         self.setScene(self.scene_)
-        self.setRenderHint(QtGui.QPainter.Antialiasing)
-        self.setDragMode(QtWidgets.QGraphicsView.RubberBandDrag)
+        # self.setRenderHint(QtGui.QPainter.Antialiasing)
+        # self.setDragMode(QtWidgets.QGraphicsView.RubberBandDrag)  # REMOVED for no pan/zoom
 
         self.table_items={}
         self.join_lines=[]
@@ -1734,24 +1728,17 @@ class EnhancedCanvasGraphicsView(QGraphicsView):
         self.collapsible_bfs_item=None
         self.target_table_item=None
 
-        self.zoom_factor=1.25
-        self.min_scale=0.1
-        self.max_scale=8.0
+        # Remove wheelEvent override => no zoom
+        # See bottom of class
 
         self.validation_timer=QTimer()
         self.validation_timer.setInterval(400)
         self.validation_timer.setSingleShot(True)
         self.validation_timer.timeout.connect(self.builder.validate_sql)
 
-    def wheelEvent(self, event):
-        if event.angleDelta().y()>0:
-            z=self.zoom_factor
-        else:
-            z=1/self.zoom_factor
-        c=self.transform().m11()
-        new_scale=c*z
-        if self.min_scale<new_scale<self.max_scale:
-            self.scale(z,z)
+    #def wheelEvent(self, event):
+    #    # COMMENTED OUT => no zoom
+    #    event.ignore()
 
     def dragEnterEvent(self, e):
         if e.mimeData().hasText():
@@ -2049,7 +2036,6 @@ class VisualQueryBuilderTab(QWidget):
         conn=self.connections[first_key]["connection"]
         try:
             c=conn.cursor()
-            # auto-limit to 10 rows for a quick sample
             if "limit" not in sql.lower():
                 sql+="\nLIMIT 10"
             c.execute(sql)
@@ -2120,6 +2106,7 @@ class VisualQueryBuilderTab(QWidget):
             self.validate_sql()
 
     def handle_drop(self, full_name, pos):
+        # If no real connection, just mock some columns
         if not self.connections:
             if full_name not in self.table_columns_map:
                 self.table_columns_map[full_name]=["id","col1","col2"]
@@ -2152,7 +2139,6 @@ class VisualQueryBuilderTab(QWidget):
         if not item or not hasattr(item,"columns"):
             return
         col_list=item.columns
-        # child->parent
         for c in col_list:
             child_key=f"{table_key}.{c}"
             if child_key in self.fk_map:
@@ -2164,7 +2150,6 @@ class VisualQueryBuilderTab(QWidget):
                     self.canvas.scene_.addItem(jl)
                     self.canvas.join_lines.append(jl)
                     jl.update_line()
-        # parent->child
         for ck,pk in self.fk_map.items():
             if pk.startswith(table_key+"."):
                 child_tab=".".join(ck.split('.')[:2])
@@ -2224,7 +2209,6 @@ class VisualQueryBuilderTab(QWidget):
         else:
             body_sql=self._generate_select()
 
-        # (# NEW) Incorporate CTEs
         ctes = self.cte_panel.get_ctes()
         if ctes:
             cte_parts=[]
@@ -2410,13 +2394,37 @@ class VisualQueryBuilderTab(QWidget):
         lines.append(")")
         return "\n".join(lines)
 
+    # (# NEW) Show or remove a "CTE as Virtual Table" on the canvas
+
+    def show_cte_as_virtual_table(self, cte_name, columns):
+        """
+        Create or update a CollapsibleTableGraphicsItem labeled e.g. "CTE:my_cte"
+        so the user can see it on the canvas and drag-join or select columns.
+        """
+        # The "table key" could be something like "CTE.my_cte"
+        table_key = f"CTE.{cte_name}"
+
+        # If it already exists, remove the old one first
+        if table_key in self.canvas.table_items:
+            self.canvas.remove_table_item(table_key)
+
+        if not columns:
+            columns = ["col1","col2"]  # fallback
+
+        # Add it near x=600,y=100, for demonstration
+        self.canvas.add_table_item(table_key, columns, 600, 100)
+
+    def remove_virtual_cte_table(self, cte_name):
+        table_key = f"CTE.{cte_name}"
+        self.canvas.remove_table_item(table_key)
+
 ################################################################################
 # 18) MainVQBWindow
 ################################################################################
 class MainVQBWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Merged VQB with CTE Support")
+        self.setWindowTitle("Merged VQB - Enhanced with CTE Virtual Tables, No Pan/Zoom, etc.")
         self.resize(1200,800)
 
         self.builder_tab=VisualQueryBuilderTab()
@@ -2427,20 +2435,22 @@ class MainVQBWindow(QMainWindow):
     def init_toolbar(self):
         tb=self.addToolBar("Main Toolbar")
 
-        fit_act=QAction("Fit to View",self)
+        fit_act=QAction("Fit to View (Manual)",self)
         fit_act.triggered.connect(self.on_fit_view)
         tb.addAction(fit_act)
 
-        layout_act=QAction("Auto-Layout",self)
+        layout_act=QAction("Auto-Layout (Manual)",self)
         layout_act.triggered.connect(self.on_auto_layout)
         tb.addAction(layout_act)
 
+        # For BFS->target col mapping demonstration, if desired
         map_act=QAction("Demo Map (srcCol1->colA)",self)
         map_act.triggered.connect(self.demo_map)
         tb.addAction(map_act)
 
     def on_fit_view(self):
         sc=self.builder_tab.canvas.scene_
+        # If you reenable setDragMode or wheelEvent, you can do fitInView. Otherwise might not be as relevant
         self.builder_tab.canvas.fitInView(sc.itemsBoundingRect(),Qt.KeepAspectRatio)
 
     def on_auto_layout(self):
@@ -2460,22 +2470,24 @@ class MainVQBWindow(QMainWindow):
         if not cv.collapsible_bfs_item or not cv.target_table_item:
             QMessageBox.information(
                 self,"No BFS or target",
-                "Switch to a DML mode (INSERT/UPDATE/DELETE) and create BFS/target items if you want to test this."
-            )
+                "Switch to a DML mode first (INSERT/UPDATE/DELETE), then create BFS/target items if you want to test demo_map.")
             return
 
+        # If BFS item or target item had columns named 'srcCol1' and 'colA', create a mapping line
         left_txt=None
         for ch in cv.collapsible_bfs_item.childItems():
             if isinstance(ch,QGraphicsTextItem):
                 if ch.toPlainText().strip().lower()=="srccol1":
                     left_txt=ch
                     break
+
         right_txt=None
         for ch in cv.target_table_item.childItems():
             if isinstance(ch,QGraphicsTextItem):
                 if ch.toPlainText().strip().lower()=="cola":
                     right_txt=ch
                     break
+
         if not left_txt or not right_txt:
             QMessageBox.information(
                 self,"Not Found","srcCol1 or colA not found in BFS/target placeholders.")
