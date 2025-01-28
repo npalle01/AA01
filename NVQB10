@@ -13,9 +13,9 @@
 #  - "SQL Import" => partial canvas rebuild using sqlglot (no "ansi")
 #  - *No forced LIMIT* in run_sql
 #  - No pan/zoom on the canvas (no setDragMode, no wheelEvent override).
+#  - **Includes fixes** so “JOIN” appears on the canvas lines & in generated SQL.
 #
 # Requires: pyodbc, sqlparse, sqlglot, PyQt5
-#
 
 import sys
 import traceback
@@ -494,7 +494,8 @@ class MappingLine(QGraphicsLineItem):
 
 class JoinLine(QGraphicsLineItem):
     """
-    A line connecting two table items for BFS multi-join usage. Has join_type label.
+    A line connecting two table items for BFS multi-join usage.
+    FIX #1: label now shows e.g. "LEFT JOIN", "INNER JOIN", etc.
     """
     def __init__(self, start_item, end_item, join_type="INNER", condition=""):
         super().__init__()
@@ -511,7 +512,7 @@ class JoinLine(QGraphicsLineItem):
             "RIGHT":(Qt.magenta, Qt.DotLine),
             "FULL": (Qt.red, Qt.DashLine),
         }
-        self.label=QGraphicsTextItem(self.join_type, self)
+        self.label=QGraphicsTextItem(f"{self.join_type} JOIN", self)  # <-- Insert "JOIN"
         self.label.setDefaultTextColor(Qt.blue)
         self.update_line()
 
@@ -711,6 +712,7 @@ class DraggableColumnTextItem(QGraphicsTextItem):
             event.acceptProposedAction()
         else:
             event.ignore()
+
 
 class CollapsibleTableGraphicsItem(QGraphicsRectItem):
     """
@@ -1835,7 +1837,6 @@ class CTEPanel(QGroupBox):
 
 ###############################################################################
 # 15) EnhancedCanvasGraphicsView => BFS multi-join & DML line
-#     No pan/zoom: we do not setDragMode or reimplement wheelEvent.
 ###############################################################################
 class EnhancedCanvasGraphicsView(QGraphicsView):
     def __init__(self, builder, parent=None):
@@ -1968,7 +1969,7 @@ class ResultDataDialog(QDialog):
 
 
 ###############################################################################
-# 17) The main VQB tab (with BFS for DML + new "no forced LIMIT" in run_sql)
+# 17) The main VQB tab (with BFS for DML + new "no forced LIMIT")
 ###############################################################################
 class VisualQueryBuilderTab(QWidget):
     def __init__(self, parent=None):
@@ -2386,6 +2387,8 @@ class VisualQueryBuilderTab(QWidget):
         """
         BFS multi-join approach:
         we gather subgraphs by adjacency from self.canvas.join_lines => produce FROM.. lines.
+        
+        FIX #2: Insert the word "JOIN" after ln.join_type.
         """
         invert={v:k for k,v in self.canvas.table_items.items()}
         adj={}
@@ -2410,7 +2413,7 @@ class VisualQueryBuilderTab(QWidget):
                         if nbr not in visited:
                             visited.add(nbr)
                             queue.append(nbr)
-                            seg.append(f"{ln.join_type} {nbr} ON {ln.condition}")
+                            seg.append(f"{ln.join_type} JOIN {nbr} ON {ln.condition}")
                 block="\n  ".join(seg)
                 if not blocks:
                     blocks.append("FROM "+block)
@@ -2611,7 +2614,7 @@ class VisualQueryBuilderTab(QWidget):
 class MainVQBWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Merged VQB - BFS for DML + No forced LIMIT + SQL Import (no 'ansi')")
+        self.setWindowTitle("Merged VQB - BFS for DML + No forced LIMIT + SQL Import (no 'ansi') - JOIN Fixed")
         self.resize(1200,800)
 
         self.builder_tab=VisualQueryBuilderTab()
@@ -2679,6 +2682,7 @@ class MainVQBWindow(QMainWindow):
             return
 
         cv.create_mapping_line(left_txt, right_txt)
+
 
 def main():
     app=QApplication(sys.argv)
