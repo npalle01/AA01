@@ -70,7 +70,7 @@ def extract_tables(sql_text: str):
     return list(set(found))
 
 ##############################################################################
-# SETUP DATABASE (WITH MULTI-STEP APPROVAL)
+# SETUP DATABASE (WITH MULTI-STEP APPROVAL & LINKING TABLE)
 ##############################################################################
 def setup_in_memory_db():
     conn = sqlite3.connect(DB_URI, uri=True, timeout=10.0)
@@ -265,6 +265,18 @@ def setup_in_memory_db():
     );
     """)
 
+    # NEW: Linking table for applying global/critical rules to sets of child rules
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS BRM_GLOBAL_CRITICAL_LINKS(
+        LINK_ID INTEGER PRIMARY KEY AUTOINCREMENT,
+        GCR_RULE_ID INTEGER NOT NULL,    -- The ID of the global/critical parent rule
+        TARGET_RULE_ID INTEGER,          -- The child rule that is driven by it
+        TARGET_GROUP_ID INTEGER,         -- (Optional) or entire rule group if needed
+        FOREIGN KEY(GCR_RULE_ID) REFERENCES BRM_RULES(RULE_ID) ON DELETE CASCADE,
+        FOREIGN KEY(TARGET_RULE_ID) REFERENCES BRM_RULES(RULE_ID) ON DELETE CASCADE
+    );
+    """)
+
     # Seed data
     groups = [
         ("Admin","Admin group","admin@example.com"),
@@ -341,7 +353,7 @@ def add_audit_log(conn, action, table_name, record_id, action_by, old_data, new_
     conn.commit()
 
 ##############################################################################
-# BFS for ETL, Stopping Child Rules If Critical Rule Fails
+# RULE EXECUTION (BFS), NOW ALSO CHECKING GLOBAL/CRITICAL LINKS
 ##############################################################################
 def build_rule_adjacency(conn):
     c = conn.cursor()
@@ -365,8 +377,8 @@ def build_rule_adjacency(conn):
 def run_rule_sql(conn, rule_sql):
     """
     Execute the rule_sql. If no row is returned, treat it as a pass.
-    If a row is returned, we expect the first column to be 1=pass, 0=fail.
-    Any exception => fail.
+    If a row is returned, we expect the first column = 1 => pass, 0 => fail.
+    Exception => fail.
     """
     try:
         c = conn.cursor()
@@ -380,16 +392,53 @@ def run_rule_sql(conn, rule_sql):
         logger.error(f"Rule execution error: {e}")
         return False
 
+def load_global_critical_links(conn):
+    """
+    Return a dict: { parent_rule_id: set(child_rule_ids) }
+    where 'parent_rule_id' is a global/critical rule, and 'child_rule_ids' 
+    are the rules that must be skipped if parent fails.
+    """
+    c = conn.cursor()
+    c.execute("SELECT GCR_RULE_ID, TARGET_RULE_ID FROM BRM_GLOBAL_CRITICAL_LINKS")
+    rows = c.fetchall()
+    link_map = {}
+    for r in rows:
+        gcr = r["GCR_RULE_ID"]
+        tgt = r["TARGET_RULE_ID"]
+        if not tgt:
+            continue
+        link_map.setdefault(gcr, set()).add(tgt)
+    return link_map
+
+def skip_descendants(child_id, children_map, skipped):
+    """
+    Recursively skip the given child_id (and all BFS descendants).
+    """
+    stack = [child_id]
+    while stack:
+        current = stack.pop()
+        if current in skipped:
+            continue
+        skipped.add(current)
+        if current in children_map:
+            stack.extend(children_map[current])
+
+def get_all_rules_as_dict(conn):
+    c = conn.cursor()
+    c.execute("SELECT * FROM BRM_RULES")
+    rows = c.fetchall()
+    return {r["RULE_ID"]: dict(r) for r in rows}
+
 def execute_rules_in_order(conn):
     children_map, root_rules = build_rule_adjacency(conn)
+    # Load global/critical links (which extra rules to skip if parent fails)
+    gcr_links = load_global_critical_links(conn)
+
     executed = []
     skipped = set()
     queue = list(root_rules)
 
-    c = conn.cursor()
-    c.execute("SELECT * FROM BRM_RULES")
-    all_rules = c.fetchall()
-    rule_lookup = {r["RULE_ID"]: dict(r) for r in all_rules}
+    rule_lookup = get_all_rules_as_dict(conn)
 
     while queue:
         rid = queue.pop(0)
@@ -400,50 +449,39 @@ def execute_rules_in_order(conn):
             continue
 
         rinfo = rule_lookup[rid]
-        rule_name = rinfo["RULE_NAME"]
         rule_sql = rinfo["RULE_SQL"]
-        is_critical = (rinfo["CRITICAL_RULE"] == 1)
-        crit_scope = rinfo["CRITICAL_SCOPE"].upper()
-        grp = rinfo["OWNER_GROUP"]
-        clus = rinfo.get("CLUSTER_NAME", "")
-
-        logger.info(f"Executing rule {rid}: {rule_name}")
+        logger.info(f"Executing rule {rid}: {rinfo['RULE_NAME']}")
         passed = run_rule_sql(conn, rule_sql)
+
         if passed:
             logger.info(f"Rule {rid} PASSED.")
             executed.append(rid)
+            # Enqueue normal BFS children
             if rid in children_map:
                 for child_id in children_map[rid]:
                     if child_id not in skipped:
                         queue.append(child_id)
         else:
             logger.warning(f"Rule {rid} FAILED.")
+            # If rule is critical or global, skip children + linked
+            is_critical = (rinfo["CRITICAL_RULE"] == 1 or rinfo["IS_GLOBAL"] == 1)
+            crit_scope = rinfo["CRITICAL_SCOPE"].upper()
             if is_critical and crit_scope != "NONE":
-                logger.warning(f"Critical rule => scope={crit_scope}, skipping children.")
-                stack = children_map.get(rid, [])[:]
-                while stack:
-                    cid = stack.pop()
-                    if cid in rule_lookup:
-                        cinfo = rule_lookup[cid]
-                        skip_it = False
-                        if crit_scope == "GLOBAL":
-                            skip_it = True
-                        elif crit_scope == "GROUP":
-                            if cinfo["OWNER_GROUP"] == grp:
-                                skip_it = True
-                        elif crit_scope == "CLUSTER":
-                            if cinfo.get("CLUSTER_NAME", "") == clus:
-                                skip_it = True
-                        if skip_it:
-                            skipped.add(cid)
-                            if cid in children_map:
-                                stack.extend(children_map[cid])
+                logger.warning(f"Critical/Global rule => scope={crit_scope}, skipping children & linked.")
+                # skip direct BFS children
+                if rid in children_map:
+                    for child_id in children_map[rid]:
+                        skip_descendants(child_id, children_map, skipped)
+                # skip anything linked
+                if rid in gcr_links:
+                    for child_rid in gcr_links[rid]:
+                        skip_descendants(child_rid, children_map, skipped)
 
     logger.info(f"ETL Complete. Executed={executed}, Skipped={list(skipped)}")
     return executed, skipped
 
 ##############################################################################
-# MULTI-STEP APPROVAL LOGIC
+# MULTI-STEP APPROVAL LOGIC (unchanged)
 ##############################################################################
 MULTISTEP_ORDER = ["BG1","BG2","BG3","FINAL"]
 
@@ -548,6 +586,9 @@ def find_child_rules(conn, parent_rule_id):
 # CRUD with MULTI-STEP APPROVALS
 ##############################################################################
 def add_rule(conn, rule_data, created_by, user_group):
+    """
+    Insert a new rule, re-initiating multi-step approvals if not global.
+    """
     is_global = rule_data.get("IS_GLOBAL",0)
     if is_global==1 and user_group!="Admin":
         raise ValueError("Only Admin can create a global rule.")
@@ -581,62 +622,27 @@ def add_rule(conn, rule_data, created_by, user_group):
       rule_data.get("CRITICAL_SCOPE","NONE")
     ))
     new_id = c.lastrowid
-    
 
     # Insert dependencies
-def add_rule(conn, rule_data, created_by, user_group):
-    """
-    Example snippet focusing on 'Insert Dependencies' without syntax errors.
-    """
-
-    c = conn.cursor()
-
-    # -- Insert the BRM_RULES record (simplified for demo) --
-    c.execute("""
-        INSERT INTO BRM_RULES(
-            RULE_TYPE_ID,
-            RULE_NAME,
-            RULE_SQL,
-            OWNER_GROUP
-        )
-        VALUES(?,?,?,?)
-    """, (
-        rule_data["RULE_TYPE_ID"],
-        rule_data["RULE_NAME"],
-        rule_data["RULE_SQL"],
-        rule_data["OWNER_GROUP"]
-    ))
-    new_rule_id = c.lastrowid
-
-    # -- Extract tables from the rule SQL --
     deps = extract_tables(rule_data["RULE_SQL"])
-
-    # -- Insert dependencies for each table found --
     for (dbn, tbn) in deps:
         c.execute("""
             INSERT INTO BRM_RULE_TABLE_DEPENDENCIES(
-                RULE_ID,
-                DATABASE_NAME,
-                TABLE_NAME,
-                COLUMN_NAME
+                RULE_ID, DATABASE_NAME, TABLE_NAME, COLUMN_NAME
             )
             VALUES(?,?,?,?)
-        """, (
-            new_rule_id,
-            dbn,
-            tbn,
-            "DerivedCol"
-        ))
-    
-    conn.commit()
-    return new_rule_id
+        """,(new_id, dbn, tbn, "DerivedCol"))
 
-    # If global => skip multi-step approvals
+    add_audit_log(conn,"INSERT","BRM_RULES", new_id, created_by, None, rule_data)
+    conn.commit()
+
+    # Multi-step approvals
     if is_global==1:
         logger.info(f"Global rule {new_id} => skipping multi-step approvals.")
     else:
         impacted = find_impacted_business_groups(conn, new_id)
         create_multistep_approvals(conn, new_id, impacted)
+
     return new_id
 
 def update_rule(conn, rule_data, updated_by, user_group):
@@ -820,7 +826,7 @@ class LoginDialog(QDialog):
             QMessageBox.warning(self, "Login Failed", "Invalid username or password.")
 
 ##############################################################################
-# RULE EDITOR DIALOG
+# RULE EDITOR DIALOG (CREATION/UPDATE)
 ##############################################################################
 class RuleEditorDialog(QDialog):
     """
@@ -900,17 +906,15 @@ class RuleEditorDialog(QDialog):
             logger.warning(f"Error loading group permissions: {ex}")
         left_layout.addRow("Owner Group:", self.owner_grp_combo)
 
-        # If Admin => global checkbox
+        # (Admin can set global, critical)
         self.global_checkbox = None
         if self.logged_in_user=="Admin":
             self.global_checkbox = QCheckBox("Global (admin-only)")
             left_layout.addRow("Global:", self.global_checkbox)
 
-        # Critical
         self.critical_checkbox = QCheckBox("Critical (Stop-on-fail)")
         left_layout.addRow("Critical Rule:", self.critical_checkbox)
 
-        # Scope
         self.scope_combo = QComboBox()
         self.scope_combo.addItems(["NONE","GROUP","CLUSTER","GLOBAL"])
         left_layout.addRow("Critical Scope:", self.scope_combo)
@@ -1610,7 +1614,7 @@ class BusinessRuleManagementTab(QWidget):
             QMessageBox.critical(self,"DB Error",str(e))
 
 ##############################################################################
-# GROUP MANAGEMENT TAB
+# GROUP MANAGEMENT TAB (admin only)
 ##############################################################################
 class GroupManagementTab(QWidget):
     """
@@ -1907,9 +1911,6 @@ class GroupManagementTab(QWidget):
         except Exception as e:
             QMessageBox.critical(self,"DB Error",str(e))
 
-    ##########################################################################
-    # GROUP BACKUP/RESTORE
-    ##########################################################################
     def on_backup_group(self):
         grp = self.get_selected_group()
         if not grp:
@@ -1955,9 +1956,6 @@ class GroupManagementTab(QWidget):
         except Exception as e:
             QMessageBox.critical(self,"DB Error",str(e))
 
-    ##########################################################################
-    # MEMBERSHIP MANAGEMENT
-    ##########################################################################
     def get_selected_user(self):
         r = self.users_table.currentRow()
         if r<0:
@@ -2005,15 +2003,11 @@ class GroupManagementTab(QWidget):
         if confirm!=QMessageBox.Yes:
             return
         c = self.connection.cursor()
-        # Example logic: move user to BG1, or handle differently
         c.execute("UPDATE USERS SET USER_GROUP='BG1' WHERE USER_ID=?",(uid,))
         self.connection.commit()
         QMessageBox.information(self,"Success","User moved to BG1.")
         self.load_data()
 
-    ##########################################################################
-    # PERMISSIONS
-    ##########################################################################
     def on_add_permission(self):
         grp = self.perm_group_combo.currentText().strip()
         if not grp:
@@ -2053,9 +2047,6 @@ class GroupManagementTab(QWidget):
         QMessageBox.information(self,"Success",f"Permission {tbl} removed from {grp}.")
         self.load_permissions()
 
-    ##########################################################################
-    # APPROVERS
-    ##########################################################################
     def on_add_approver(self):
         grp = self.appr_group_combo.currentText().strip()
         if not grp:
@@ -2312,7 +2303,6 @@ def restore_custom_group(conn, custom_group_id, backup_version, action_by="Syste
         c.execute(f"DELETE FROM BRM_COLUMN_MAPPING WHERE RULE_ID IN ({placeholders})", mem_ids)
         c.execute(f"DELETE FROM BRM_RULES WHERE RULE_ID IN ({placeholders})", mem_ids)
 
-    # Insert from backup
     for rd in backup_data["rules"]:
         c.execute("""
           INSERT INTO BRM_RULES(
@@ -2364,7 +2354,6 @@ def restore_custom_group(conn, custom_group_id, backup_version, action_by="Syste
 class CustomRuleGroupTab(QWidget):
     """
     Lets user create custom rule groups and manage membership.
-    Supports backups/restores for the custom group’s membership rules.
     """
     def __init__(self, main_app, connection, user_id, user_group, parent=None):
         super().__init__(parent)
@@ -2638,7 +2627,7 @@ class CustomRuleGroupTab(QWidget):
             QMessageBox.critical(self,"Error",str(e))
 
 ##############################################################################
-# APPROVAL PIPELINE WIDGET
+# APPROVAL PIPELINE WIDGET (unchanged)
 ##############################################################################
 class ApprovalPipelineWidget(QWidget):
     """
@@ -2829,8 +2818,8 @@ class RuleEllipseItem(QtWidgets.QGraphicsEllipseItem):
 class EnhancedLineageGraphWidget(QtWidgets.QGraphicsView):
     """
     Displays a BFS-based lineage graph of all rules. 
-    DQ rules => Rectangle, DM rules => Ellipse, color-coded by status, etc.
-    Right-click context menu for highlight ancestors/descendants or edit rule.
+    DQ => Rectangle, DM => Ellipse, color-coded by status, etc.
+    Right-click: highlight ancestors/descendants or edit rule.
     """
     def __init__(self, connection, parent=None):
         super().__init__(parent)
@@ -2844,14 +2833,6 @@ class EnhancedLineageGraphWidget(QtWidgets.QGraphicsView):
         self.node_map={}
         self.children_map={}
         self.parents_map={}
-
-        # Minimap not strictly necessary, but shown in code
-        self.minimap = QtWidgets.QGraphicsView(self.scene)
-        self.minimap.setRenderHint(QtGui.QPainter.Antialiasing)
-        self.minimap.setFixedSize(200,150)
-        self.minimap.setStyleSheet("background:rgba(255,255,255,0.7);border:1px solid gray;")
-        self.minimap.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        self.minimap.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
 
         self.detail_dock = QDockWidget("Rule Details", self.parentWidget())
         self.detail_panel = QTextEdit()
@@ -2872,12 +2853,6 @@ class EnhancedLineageGraphWidget(QtWidgets.QGraphicsView):
                 return w
             w = w.parent()
         return None
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        x = self.width()-self.minimap.width()-20
-        y = 20
-        self.minimap.move(x,y)
 
     def populate_graph(self):
         self.scene.clear()
@@ -2908,7 +2883,6 @@ class EnhancedLineageGraphWidget(QtWidgets.QGraphicsView):
         rule_lookup = {r["RULE_ID"]:r for r in rules}
         roots = [r for r in rules if not r["PARENT_RULE_ID"]]
 
-        from collections import deque
         queue = deque()
         level_map={}
         visited=set()
@@ -2943,7 +2917,7 @@ class EnhancedLineageGraphWidget(QtWidgets.QGraphicsView):
                 self.draw_edge(pid, rid)
 
         self.scene.setSceneRect(self.scene.itemsBoundingRect())
-        self.reset_minimap()
+        self.resetView()
 
     def create_node(self, rinfo):
         rtype = rinfo["RULE_TYPE_ID"]
@@ -2952,32 +2926,28 @@ class EnhancedLineageGraphWidget(QtWidgets.QGraphicsView):
         isg = rinfo["IS_GLOBAL"]
         icrit = rinfo["CRITICAL_RULE"]
 
-        # rectangle for DQ, ellipse for DM
         if rtype==1:
             node = RuleRectItem(0,0,120,50,rinfo,cluster)
         else:
             node = RuleEllipseItem(0,0,120,50,rinfo,cluster)
 
-        # color fill
         if status.lower()=="active":
             basecol = QtGui.QColor("lightgreen")
         else:
             basecol = QtGui.QColor("tomato")
 
-        # Optionally vary color by cluster or do your own logic
+        # Optionally vary color by cluster
         if cluster:
             hval = abs(hash(cluster))%360
             basecol = QtGui.QColor.fromHsv(hval,128,255)
 
         node.setBrush(QtGui.QBrush(basecol))
 
-        # border if critical
         pen = QtGui.QPen(QtCore.Qt.black,2)
         if icrit==1:
             pen = QtGui.QPen(QtGui.QColor("red"),3)
         node.setPen(pen)
 
-        # If global => prefix name
         if isg==1:
             rinfo["RULE_NAME"] = f"(G) {rinfo['RULE_NAME']}"
 
@@ -2994,14 +2964,9 @@ class EnhancedLineageGraphWidget(QtWidgets.QGraphicsView):
         line.setPen(QtGui.QPen(QtGui.QColor("darkblue"),2))
         self.scene.addItem(line)
 
-    def reset_minimap(self):
-        if self.scene and self.scene.sceneRect().isValid():
-            self.minimap.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
-
     def resetView(self):
         if self.scene and self.scene.sceneRect().isValid():
             self.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
-        self.reset_minimap()
 
     def mousePressEvent(self, event):
         if event.button()==Qt.LeftButton:
@@ -3043,7 +3008,6 @@ class EnhancedLineageGraphWidget(QtWidgets.QGraphicsView):
                 dlg = RuleEditorDialog(self.connection, rmap, "Admin", rowd, parent=self)
                 dlg.exec_()
                 self.populate_graph()
-
             edit_act.triggered.connect(on_edit)
             menu.addAction(edit_act)
 
@@ -3058,7 +3022,6 @@ class EnhancedLineageGraphWidget(QtWidgets.QGraphicsView):
                 self.highlight_descendants(rinfo["RULE_ID"])
             desc_act.triggered.connect(on_desc)
             menu.addAction(desc_act)
-
         else:
             clear_act = QtWidgets.QAction("Clear Highlights", menu)
             def on_clear():
@@ -3129,8 +3092,6 @@ class EnhancedLineageGraphWidget(QtWidgets.QGraphicsView):
 
         if not found_any:
             QMessageBox.information(self,"No Match",f"No rule or column found for '{query}'")
-        else:
-            self.reset_minimap()
 
 ##############################################################################
 # CONTROL TABLES TAB
@@ -3160,7 +3121,8 @@ class CtrlTablesTab(QWidget):
             "BRM_CUSTOM_GROUP_MEMBERS",
             "BUSINESS_GROUP_APPROVERS",
             "BRM_RULE_APPROVALS",
-            "BRM_CUSTOM_GROUP_BACKUPS"
+            "BRM_CUSTOM_GROUP_BACKUPS",
+            "BRM_GLOBAL_CRITICAL_LINKS"
         ]
         self.table_combo = QComboBox()
         for t in self.table_list:
@@ -3206,11 +3168,14 @@ class CtrlTablesTab(QWidget):
                 self.table_view.setItem(r, j, QTableWidgetItem(item_str))
 
 ##############################################################################
-# GLOBAL/CRITICAL ADMIN TAB
+# GLOBAL/CRITICAL ADMIN TAB (NEW APPROACH)
 ##############################################################################
 class GlobalCriticalAdminTab(QWidget):
     """
-    Allows Admin to quickly create Global or Critical rules.
+    Allows Admin to:
+    - Toggle existing rules as Global or Critical (and set CRITICAL_SCOPE).
+    - Link/unlink child rules to a selected Global/Critical rule (so if parent fails, skip child).
+    - View which child rules are driven by each GCR rule.
     """
     def __init__(self, main_app, connection, user_group, parent=None):
         super().__init__(parent)
@@ -3225,82 +3190,316 @@ class GlobalCriticalAdminTab(QWidget):
             self.setLayout(layout)
             return
 
-        form = QFormLayout()
-        self.rule_name_edit = QLineEdit()
-        form.addRow("Rule Name:", self.rule_name_edit)
+        # Top Filter: search text, load rules
+        filter_layout = QHBoxLayout()
+        filter_layout.addWidget(QLabel("Search Rule Name/SQL:"))
+        self.search_edit = QLineEdit()
+        filter_layout.addWidget(self.search_edit)
 
-        self.rule_sql_edit = QPlainTextEdit()
-        self.rule_sql_edit.setPlainText("SELECT 1;")
-        form.addRow("Rule SQL:", self.rule_sql_edit)
+        btn_filter = QPushButton("Filter")
+        btn_filter.clicked.connect(self.load_rule_list)
+        filter_layout.addWidget(btn_filter)
+        filter_layout.addStretch()
 
-        self.global_check = QCheckBox("Is Global Rule?")
-        form.addRow("Global?", self.global_check)
+        layout.addLayout(filter_layout)
 
-        self.critical_check = QCheckBox("Is Critical Rule?")
-        form.addRow("Critical?", self.critical_check)
+        # Table of rules
+        self.rule_table = QTableWidget(0,6)
+        self.rule_table.setHorizontalHeaderLabels([
+            "Rule ID","Name","Owner Group","Global?","Critical?","Scope"
+        ])
+        self.rule_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.rule_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        layout.addWidget(self.rule_table)
 
+        # Buttons for toggling
+        btn_row = QHBoxLayout()
+
+        btn_g_on = QPushButton("Mark Selected As Global")
+        btn_g_on.clicked.connect(self.mark_selected_as_global)
+        btn_row.addWidget(btn_g_on)
+
+        btn_g_off = QPushButton("Unmark Selected As Global")
+        btn_g_off.clicked.connect(self.unmark_selected_as_global)
+        btn_row.addWidget(btn_g_off)
+
+        btn_c_on = QPushButton("Mark Selected As Critical")
+        btn_c_on.clicked.connect(self.mark_selected_as_critical)
+        btn_row.addWidget(btn_c_on)
+
+        btn_c_off = QPushButton("Unmark Selected As Critical")
+        btn_c_off.clicked.connect(self.unmark_selected_as_critical)
+        btn_row.addWidget(btn_c_off)
+
+        # Scope combo
         self.scope_combo = QComboBox()
         self.scope_combo.addItems(["NONE","GROUP","CLUSTER","GLOBAL"])
-        form.addRow("Critical Scope:", self.scope_combo)
+        btn_row.addWidget(QLabel("Set Scope:"))
+        btn_row.addWidget(self.scope_combo)
 
-        rtypes_map = self.main_app.get_rule_types()
-        self.rule_type_combo = QComboBox()
-        for k in rtypes_map:
-            self.rule_type_combo.addItem(k)
-        form.addRow("Rule Type:", self.rule_type_combo)
+        btn_scope = QPushButton("Apply Scope to Selected")
+        btn_scope.clicked.connect(self.apply_scope_to_selected)
+        btn_row.addWidget(btn_scope)
 
-        self.owner_grp_combo = QComboBox()
-        c = self.connection.cursor()
-        c.execute("SELECT GROUP_NAME FROM BUSINESS_GROUPS ORDER BY GROUP_NAME")
-        for row in c.fetchall():
-            self.owner_grp_combo.addItem(row["GROUP_NAME"])
-        form.addRow("Owner Group:", self.owner_grp_combo)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
 
-        layout.addLayout(form)
+        # Link/unlink child rules
+        link_box = QHBoxLayout()
+        self.gcr_rule_combo = QComboBox()
+        link_box.addWidget(QLabel("Select Parent GCR Rule:"))
+        link_box.addWidget(self.gcr_rule_combo)
 
-        btn_h = QHBoxLayout()
-        create_btn = QPushButton("Create Global/Critical Rule")
-        create_btn.clicked.connect(self.on_create_rule)
-        btn_h.addWidget(create_btn)
-        btn_h.addStretch()
-        layout.addLayout(btn_h)
+        self.child_rule_combo = QComboBox()
+        link_box.addWidget(QLabel("Child Rule to Link/Unlink:"))
+        link_box.addWidget(self.child_rule_combo)
+
+        btn_link = QPushButton("Link Child")
+        btn_link.clicked.connect(self.link_child_rule)
+        link_box.addWidget(btn_link)
+
+        btn_unlink = QPushButton("Unlink Child")
+        btn_unlink.clicked.connect(self.unlink_child_rule)
+        link_box.addWidget(btn_unlink)
+
+        link_box.addStretch()
+        layout.addLayout(link_box)
+
+        # A table that shows "Which child rules are driven by the selected parent GCR rule"
+        self.link_view = QTableWidget(0,2)
+        self.link_view.setHorizontalHeaderLabels(["Parent GCR ID","Child Rule ID"])
+        self.link_view.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.link_view)
+
+        # Refresh button
+        ref_btn = QPushButton("Refresh Everything")
+        ref_btn.clicked.connect(self.refresh_all)
+        layout.addWidget(ref_btn)
 
         self.setLayout(layout)
 
-    def on_create_rule(self):
-        is_g = 1 if self.global_check.isChecked() else 0
-        is_c = 1 if self.critical_check.isChecked() else 0
-        cscope = self.scope_combo.currentText()
-        rname = self.rule_name_edit.text().strip()
-        rsql = self.rule_sql_edit.toPlainText().strip()
-        if not rname or not rsql:
-            QMessageBox.warning(self,"Error","Rule name & SQL required.")
+        self.refresh_all()
+
+    def refresh_all(self):
+        self.load_rule_list()
+        self.populate_gcr_rule_combo()
+        self.populate_child_rule_combo()
+        self.load_link_view()
+
+    def load_rule_list(self):
+        txt = self.search_edit.text().strip()
+        c = self.connection.cursor()
+        if txt:
+            c.execute("""
+                SELECT RULE_ID,RULE_NAME,OWNER_GROUP,IS_GLOBAL,CRITICAL_RULE,CRITICAL_SCOPE
+                FROM BRM_RULES
+                WHERE RULE_NAME LIKE ? OR RULE_SQL LIKE ?
+                ORDER BY RULE_ID DESC
+            """,(f"%{txt}%", f"%{txt}%"))
+        else:
+            c.execute("""
+                SELECT RULE_ID,RULE_NAME,OWNER_GROUP,IS_GLOBAL,CRITICAL_RULE,CRITICAL_SCOPE
+                FROM BRM_RULES
+                ORDER BY RULE_ID DESC
+            """)
+        rows = c.fetchall()
+
+        self.rule_table.setRowCount(0)
+        for row in rows:
+            r = self.rule_table.rowCount()
+            self.rule_table.insertRow(r)
+            self.rule_table.setItem(r,0,QTableWidgetItem(str(row["RULE_ID"])))
+            self.rule_table.setItem(r,1,QTableWidgetItem(row["RULE_NAME"]))
+            self.rule_table.setItem(r,2,QTableWidgetItem(row["OWNER_GROUP"]))
+            g_str = "YES" if row["IS_GLOBAL"]==1 else "NO"
+            self.rule_table.setItem(r,3,QTableWidgetItem(g_str))
+            c_str = "YES" if row["CRITICAL_RULE"]==1 else "NO"
+            self.rule_table.setItem(r,4,QTableWidgetItem(c_str))
+            sc_str = row["CRITICAL_SCOPE"]
+            self.rule_table.setItem(r,5,QTableWidgetItem(sc_str))
+
+    def get_selected_rule_ids(self):
+        idxs = self.rule_table.selectionModel().selectedRows()
+        rids = []
+        for i in idxs:
+            row = i.row()
+            it = self.rule_table.item(row,0)
+            if it:
+                rids.append(int(it.text()))
+        return rids
+
+    def mark_selected_as_global(self):
+        rids = self.get_selected_rule_ids()
+        if not rids:
+            QMessageBox.warning(self,"No selection","No rule(s) selected.")
             return
+        c = self.connection.cursor()
+        for rid in rids:
+            c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?",(rid,))
+            old = c.fetchone()
+            if not old:
+                continue
+            rd = dict(old)
+            rd["IS_GLOBAL"] = 1
+            try:
+                update_rule(self.connection, rd, "Admin", "Admin")
+            except Exception as e:
+                logger.error(e)
+        QMessageBox.information(self,"Global Applied",f"{len(rids)} rule(s) marked global.")
+        self.load_rule_list()
 
-        rt_map = self.main_app.get_rule_types()
-        sel_rt = self.rule_type_combo.currentText()
-        rt_id = rt_map.get(sel_rt, 1)
+    def unmark_selected_as_global(self):
+        rids = self.get_selected_rule_ids()
+        if not rids:
+            QMessageBox.warning(self,"No selection","No rule(s).")
+            return
+        c = self.connection.cursor()
+        for rid in rids:
+            c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?",(rid,))
+            old = c.fetchone()
+            if not old:
+                continue
+            rd = dict(old)
+            rd["IS_GLOBAL"] = 0
+            try:
+                update_rule(self.connection, rd, "Admin", "Admin")
+            except Exception as e:
+                logger.error(e)
+        QMessageBox.information(self,"Global Removed",f"{len(rids)} rule(s) unmarked global.")
+        self.load_rule_list()
 
-        ow_grp = self.owner_grp_combo.currentText()
+    def mark_selected_as_critical(self):
+        rids = self.get_selected_rule_ids()
+        if not rids:
+            QMessageBox.warning(self,"No selection","No rule(s).")
+            return
+        c = self.connection.cursor()
+        for rid in rids:
+            c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?",(rid,))
+            old = c.fetchone()
+            if not old:
+                continue
+            rd = dict(old)
+            rd["CRITICAL_RULE"] = 1
+            try:
+                update_rule(self.connection, rd, "Admin", "Admin")
+            except Exception as e:
+                logger.error(e)
+        QMessageBox.information(self,"Critical Applied",f"{len(rids)} rule(s) marked critical.")
+        self.load_rule_list()
 
-        rule_data = {
-            "RULE_NAME": rname,
-            "RULE_SQL": rsql,
-            "RULE_TYPE_ID": rt_id,
-            "OWNER_GROUP": ow_grp,
-            "IS_GLOBAL": is_g,
-            "CRITICAL_RULE": is_c,
-            "CRITICAL_SCOPE": cscope,
-            "EFFECTIVE_START_DATE": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "EFFECTIVE_END_DATE": (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S"),
-            "OPERATION_TYPE": "OTHER"
-        }
-        try:
-            new_id = add_rule(self.connection, rule_data, "Admin", "Admin")
-            QMessageBox.information(self,"Created",
-                                    f"Global/Critical rule {new_id} created successfully.")
-        except Exception as e:
-            QMessageBox.critical(self,"Error",str(e))
+    def unmark_selected_as_critical(self):
+        rids = self.get_selected_rule_ids()
+        if not rids:
+            QMessageBox.warning(self,"No selection","No rule(s).")
+            return
+        c = self.connection.cursor()
+        for rid in rids:
+            c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?",(rid,))
+            old = c.fetchone()
+            if not old:
+                continue
+            rd = dict(old)
+            rd["CRITICAL_RULE"] = 0
+            rd["CRITICAL_SCOPE"] = "NONE"
+            try:
+                update_rule(self.connection, rd, "Admin", "Admin")
+            except Exception as e:
+                logger.error(e)
+        QMessageBox.information(self,"Critical Removed",f"{len(rids)} rule(s) unmarked critical.")
+        self.load_rule_list()
+
+    def apply_scope_to_selected(self):
+        rids = self.get_selected_rule_ids()
+        if not rids:
+            QMessageBox.warning(self,"No selection","No rule(s).")
+            return
+        chosen_scope = self.scope_combo.currentText()
+        c = self.connection.cursor()
+        for rid in rids:
+            c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?",(rid,))
+            old = c.fetchone()
+            if not old:
+                continue
+            rd = dict(old)
+            rd["CRITICAL_SCOPE"] = chosen_scope
+            try:
+                update_rule(self.connection, rd, "Admin", "Admin")
+            except Exception as e:
+                logger.error(e)
+        QMessageBox.information(self,"Scope Applied",f"Scope '{chosen_scope}' applied to {len(rids)} rule(s).")
+        self.load_rule_list()
+
+    # ---------- Link/Unlink child rules -----------
+    def populate_gcr_rule_combo(self):
+        """
+        Fill with rules that are global or critical (the potential parent).
+        """
+        c = self.connection.cursor()
+        c.execute("""
+          SELECT RULE_ID,RULE_NAME
+          FROM BRM_RULES
+          WHERE IS_GLOBAL=1 OR CRITICAL_RULE=1
+          ORDER BY RULE_ID
+        """)
+        rows = c.fetchall()
+        self.gcr_rule_combo.clear()
+        for row in rows:
+            disp = f"ID:{row['RULE_ID']} - {row['RULE_NAME']}"
+            self.gcr_rule_combo.addItem(disp, row["RULE_ID"])
+
+    def populate_child_rule_combo(self):
+        c = self.connection.cursor()
+        c.execute("SELECT RULE_ID,RULE_NAME FROM BRM_RULES ORDER BY RULE_ID")
+        rows = c.fetchall()
+        self.child_rule_combo.clear()
+        for row in rows:
+            disp = f"ID:{row['RULE_ID']} - {row['RULE_NAME']}"
+            self.child_rule_combo.addItem(disp, row["RULE_ID"])
+
+    def link_child_rule(self):
+        parent_id = self.gcr_rule_combo.currentData()
+        child_id = self.child_rule_combo.currentData()
+        if not parent_id or not child_id:
+            QMessageBox.warning(self,"Error","Select a parent and child rule.")
+            return
+        c = self.connection.cursor()
+        c.execute("""
+            INSERT OR IGNORE INTO BRM_GLOBAL_CRITICAL_LINKS(GCR_RULE_ID,TARGET_RULE_ID)
+            VALUES(?,?)
+        """,(parent_id, child_id))
+        self.connection.commit()
+        QMessageBox.information(self,"Linked",f"Child rule {child_id} linked to GCR {parent_id}")
+        self.load_link_view()
+
+    def unlink_child_rule(self):
+        parent_id = self.gcr_rule_combo.currentData()
+        child_id = self.child_rule_combo.currentData()
+        if not parent_id or not child_id:
+            QMessageBox.warning(self,"Error","Select a parent and child rule.")
+            return
+        c = self.connection.cursor()
+        c.execute("""
+            DELETE FROM BRM_GLOBAL_CRITICAL_LINKS
+            WHERE GCR_RULE_ID=? AND TARGET_RULE_ID=?
+        """,(parent_id, child_id))
+        self.connection.commit()
+        QMessageBox.information(self,"Unlinked",f"Child rule {child_id} unlinked from GCR {parent_id}")
+        self.load_link_view()
+
+    def load_link_view(self):
+        """
+        Show all rows in BRM_GLOBAL_CRITICAL_LINKS, so we see which parent->child relationships exist.
+        """
+        c = self.connection.cursor()
+        c.execute("SELECT GCR_RULE_ID, TARGET_RULE_ID FROM BRM_GLOBAL_CRITICAL_LINKS ORDER BY GCR_RULE_ID")
+        rows = c.fetchall()
+        self.link_view.setRowCount(0)
+        for row in rows:
+            r = self.link_view.rowCount()
+            self.link_view.insertRow(r)
+            self.link_view.setItem(r,0,QTableWidgetItem(str(row["GCR_RULE_ID"])))
+            self.link_view.setItem(r,1,QTableWidgetItem(str(row["TARGET_RULE_ID"])))
 
 ##############################################################################
 # MAIN WINDOW
@@ -3393,7 +3592,7 @@ class BRMTool(QMainWindow):
         self.approv_tab = MultiStepApprovalTab(self.connection, self.logged_in_username, self.user_group)
         self.tabs.addTab(self.approv_tab,"Approvals")
 
-        # 6) Global/Critical Admin (admin-only)
+        # 6) Global/Critical Admin (admin-only) => new approach
         if self.user_group=="Admin":
             self.gc_admin_tab = GlobalCriticalAdminTab(self, self.connection, self.user_group)
             self.tabs.addTab(self.gc_admin_tab, "Global/Critical Admin")
@@ -3443,7 +3642,6 @@ class BRMTool(QMainWindow):
         lb.setStyleSheet("font-weight:bold;")
         lw_layout.addWidget(lb)
         lw_layout.addWidget(self.lineage_tab)
-
         s_h = QHBoxLayout()
         self.lineage_search = QLineEdit()
         self.lineage_search.setPlaceholderText("Search rule or column...")
@@ -3460,7 +3658,7 @@ class BRMTool(QMainWindow):
         s_h.addStretch()
         lw_layout.addLayout(s_h)
         line_w.setLayout(lw_layout)
-        self.tabs.addTab(line_w, "Lineage Visualization")
+        self.tabs.addTab(line_w,"Lineage Visualization")
         self.lineage_tab.populate_graph()
 
         self.custom_tab = CustomRuleGroupTab(self, self.connection, self.user_id, self.user_group)
