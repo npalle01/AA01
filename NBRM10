@@ -581,20 +581,55 @@ def add_rule(conn, rule_data, created_by, user_group):
       rule_data.get("CRITICAL_SCOPE","NONE")
     ))
     new_id = c.lastrowid
+    
 
     # Insert dependencies
+def add_rule(conn, rule_data, created_by, user_group):
+    """
+    Example snippet focusing on 'Insert Dependencies' without syntax errors.
+    """
+
+    c = conn.cursor()
+
+    # -- Insert the BRM_RULES record (simplified for demo) --
+    c.execute("""
+        INSERT INTO BRM_RULES(
+            RULE_TYPE_ID,
+            RULE_NAME,
+            RULE_SQL,
+            OWNER_GROUP
+        )
+        VALUES(?,?,?,?)
+    """, (
+        rule_data["RULE_TYPE_ID"],
+        rule_data["RULE_NAME"],
+        rule_data["RULE_SQL"],
+        rule_data["OWNER_GROUP"]
+    ))
+    new_rule_id = c.lastrowid
+
+    # -- Extract tables from the rule SQL --
     deps = extract_tables(rule_data["RULE_SQL"])
+
+    # -- Insert dependencies for each table found --
     for (dbn, tbn) in deps:
         c.execute("""
-          INSERT INTO BRM_RULE_TABLE_DEPENDENCIES(RULE_ID,DATABASE_NAME,TABLE_NAME,COLUMN_NAME)
-          VALUES(?,?,?,?)
-        """,(new_id, dbn, tbn,
-
-```python
-"DerivedCol"))
-
-    add_audit_log(conn,"ADD","BRM_RULES", new_id, created_by, None, rule_data)
+            INSERT INTO BRM_RULE_TABLE_DEPENDENCIES(
+                RULE_ID,
+                DATABASE_NAME,
+                TABLE_NAME,
+                COLUMN_NAME
+            )
+            VALUES(?,?,?,?)
+        """, (
+            new_rule_id,
+            dbn,
+            tbn,
+            "DerivedCol"
+        ))
+    
     conn.commit()
+    return new_rule_id
 
     # If global => skip multi-step approvals
     if is_global==1:
