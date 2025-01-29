@@ -1,0 +1,249 @@
+Below is a user guide for the BRM Tool application. This guide is written in a step-by-step manner so that both end-users (regular users) and administrators can quickly get started and master the main features of the tool.
+
+BRM Tool User Guide
+
+1. Introduction
+
+BRM Tool is a PyQt5-based desktop application for managing business rules, users, groups, approvals, and backups. It uses an in-memory SQLite database (by default) with strong application-level enforcement of foreign keys and constraints. This ensures data integrity without relying on database triggers.
+
+Key Features
+	•	User Login with group-based permissions
+	•	Business Rule Management (CRUD: create, read, update, delete)
+	•	Group Management (admin-only)
+	•	Multi-Step Approval Process for rules
+	•	Custom Rule Groups for grouped rule subsets
+	•	Backup and Restore for both business groups and custom rule groups
+	•	Lineage Visualization to see rule dependencies and flows
+	•	Audit Logging of all major CRUD operations
+
+2. Getting Started
+
+2.1 Prerequisites
+	1.	Python 3.7+ installed on your system
+	2.	PyQt5 and pyqtgraph libraries installed
+
+pip install pyqt5 pyqtgraph
+
+
+	3.	SQLite is embedded within Python, so no extra server setup is needed.
+
+2.2 Running the Application
+	1.	Clone or download the BRM Tool code.
+	2.	Open a terminal (or command prompt) in the directory containing brmtool_pyqtgraph.py (or however your main file is named).
+	3.	Execute:
+
+python brmtool_pyqtgraph.py
+
+The application window (BRM Tool) will appear.
+
+3. Logging In
+	1.	Launch the tool as described above.
+	2.	You will be presented with a Login Dialog:
+	•	Enter your Username and Password.
+	•	Click Login.
+	3.	If the credentials are valid, the main application window opens. Otherwise, an error message appears.
+
+Default Credentials
+
+Username	Password	Group
+admin	admin	Admin
+bg1_user	user	BG1
+bg2_user	user	BG2
+bg3_user	user	BG3
+
+	Note: The Admin user has elevated privileges allowing them to manage users and business groups.
+
+4. Main Window Overview
+
+Once logged in, you will see a tabbed interface. Depending on your user group, certain tabs might be restricted or hidden.
+	1.	Business Rule Management
+	2.	Group Management (admin-only)
+	3.	Lineage Visualization
+	4.	Custom Rule Groups
+	5.	Approvals
+	6.	Global/Critical Admin (admin-only)
+	7.	Control Tables
+
+Additionally, if you are Admin, you’ll see a small interface at the top to Impersonate other users (i.e., switch user).
+
+5. Business Rule Management
+
+5.1 Overview
+
+This tab displays a Rule Dashboard where you can view and manage all business rules. You can search rules by name or SQL, filter by status, and paginate through results.
+
+5.2 Actions
+	1.	Add Rule
+	•	Click “Add Rule”.
+	•	Fill out the Rule Editor Dialog:
+	•	Rule Name, Rule Type, SQL, Owner Group, etc.
+	•	Click “Add” to create the rule.
+	•	The newly created rule is set to INACTIVE and APPROVAL_IN_PROGRESS; relevant approvals are automatically created.
+	2.	Update Rule
+	•	Select a rule in the dashboard table.
+	•	Click “Update Rule”.
+	•	Modify fields in the Rule Editor Dialog.
+	•	Click “Save” to apply changes.
+	•	Rule returns to INACTIVE status, and approvals are re-initiated.
+	3.	Deactivate Selected
+	•	Select one or more approved and active rules.
+	•	Click “Deactivate Selected”.
+	•	These rules become INACTIVE if they have no active child rules.
+	4.	Delete Rule
+	•	Select one or more INACTIVE and approved rules.
+	•	Click “Delete Rule”.
+	•	Confirms you want to delete them.
+	•	Rules that still have child references or incomplete approvals cannot be deleted.
+	5.	View Audit Logs
+	•	Opens a separate viewer showing the last 1000 changes.
+	•	Useful for tracking historical changes or debugging.
+	6.	Search Rules
+	•	Opens a Search Rule dialog. You can enter text to match rule names or SQL snippets.
+	7.	Run ETL (Execute Rules)
+	•	Click “Run ETL (Execute Rules)”.
+	•	Executes each rule’s SQL in a topological order (parents first).
+	•	Logs the success or failure of each rule.
+	•	Critical or global rules that fail will cause dependent child rules to be skipped.
+
+5.3 Pagination and Filters
+	•	Search bar: Filters rules by name or SQL snippet.
+	•	Status filter: Show All, ACTIVE, INACTIVE, or DELETED.
+	•	Pagination: If you have many rules, use Previous / Next buttons and the page indicator to navigate.
+
+6. Group Management (Admin Only)
+
+If you are Admin, you have a Group Management tab containing multiple sub-tabs:
+
+6.1 Groups & Membership
+	1.	View Existing Business Groups
+	•	A table lists group Name, Description, and Email.
+	2.	Add Group
+	•	Click “Add Group”, enter a Group Name, description, and email.
+	•	A new business group is created.
+	3.	Rename Group
+	•	Select a group from the list, click “Rename Group”.
+	•	Provide a new name.
+	•	The system updates references in BRM_RULES, GROUP_PERMISSIONS, etc.
+	4.	Delete Group
+	•	Select a group and click “Delete Group”.
+	•	The group must have 0 users assigned; otherwise, an error message appears.
+	5.	Backup / Restore Group
+	•	Backup Group: Takes a snapshot of rules belonging to this business group.
+	•	Restore Group: Restores the group to a previous version. Overwrites existing group rules with the backup.
+	6.	Membership Management
+	•	Shows a Users table (User ID, Username, Group).
+	•	Add User to Group: Moves a user to a specified group.
+	•	Remove User from Group: Moves a user to a “default group” (e.g., BG1).
+
+6.2 Group Permissions
+	•	Each business group can have access to certain target tables.
+	•	Select a group in the combo box, view or modify Target Tables:
+	•	Add Permission: Assign a new table to the selected group.
+	•	Remove Permission: Remove a table permission from the group.
+
+6.3 Approvers Management
+	•	Each business group may have Approvers who participate in rule approvals.
+	•	Add Approver: Enter a username who will serve as an approver for the group.
+	•	Remove Approver: Remove an existing approver from the group.
+
+7. Lineage Visualization
+
+This tab shows a graph of your rules:
+	1.	Nodes: Each rule is displayed either as a rectangle (for certain rule types) or ellipse.
+	2.	Edges: Lines connecting parent rules to their child rules.
+	3.	Interactive:
+	•	Search bar allows you to find rules by name or column references.
+	•	Highlight Ancestors or Highlight Descendants from the right-click context menu on a node.
+	•	Reset View re-fits the entire graph to your window.
+	•	Refresh Graph re-builds the lineage from the current database state.
+
+When you left-click on a node, a Rule Details panel (dock widget) displays that rule’s basic metadata (ID, Name, Status, Type, etc.).
+
+8. Custom Rule Groups
+
+A Custom Rule Group is a user-defined grouping of rules that can belong to different owner groups.
+	1.	Create Custom Group
+	•	Enter a Custom Group Name in the text field at the top, then click “Create Custom Group.”
+	2.	Manage Custom Groups
+	•	A table lists existing custom groups with Group ID, Group Name, Owner BG.
+	•	Selecting a custom group displays its current Rules on the right side.
+	3.	Add or Remove Rules from a Custom Group
+	•	Left side shows All Rules.
+	•	Right side shows Rules in the selected custom group.
+	•	Use the “Add Rule →” button to move selected rules into the custom group, or “← Remove Rule” to remove them.
+	4.	Backup / Restore Custom Group
+	•	Backup Custom Group: Creates a snapshot of all rules in that custom group.
+	•	Restore Custom Group: Restores all rules in the custom group from a chosen backup version, overwriting existing ones.
+
+9. Approvals
+
+In the Approvals tab:
+	1.	List of Pending Approvals for the logged-in user.
+	2.	Each row shows the Rule ID, Group Name, Rule Name, Stage, Approved Flag, an Approve button, and a Pipeline visualization.
+	3.	Click “Approve” to mark a rule as approved at your stage.
+	4.	Once all required stages are approved, the rule becomes ACTIVE. Otherwise, it remains INACTIVE and APPROVAL_IN_PROGRESS.
+
+10. Global/Critical Admin (Admin Only)
+
+Administrators can manage:
+	1.	Search for rules by name or SQL snippet.
+	2.	Mark or Unmark rules as Global or Critical:
+	•	Global means the rule can be recognized as universally enforced, bypassing normal multi-step approvals if needed.
+	•	Critical means it halts child rules if it fails.
+	3.	Set Critical Scope (NONE, GROUP, CLUSTER, GLOBAL) on multiple selected rules.
+	4.	Link Child Rule for global/critical parent rule relationships.
+	5.	Unlink Child Rule to remove that relationship.
+
+11. Control Tables
+
+This tab provides direct viewing (read-only) of all underlying database tables. You can select any table name in the dropdown to view its contents. It’s primarily for debugging or inspecting how data is stored under the hood.
+
+12. Audit Logs
+
+Throughout the application, any create, update, or delete operation is recorded in the BRM_AUDIT_LOG table. You can view these logs via:
+	•	“View Audit Logs” button (in the Business Rule Management tab), or
+	•	Directly from the Audit Log Viewer if you integrate that in your UI.
+
+Columns:
+	•	ACTION: INSERT, UPDATE, DELETE, etc.
+	•	TABLE_NAME: Name of the table modified (e.g., BRM_RULES, USERS).
+	•	RECORD_ID: The primary key (ID) of the affected record.
+	•	ACTION_BY: Username or group performing the action.
+	•	OLD_DATA: JSON with the record’s previous state (for UPDATE/DELETE).
+	•	NEW_DATA: JSON with the record’s new state (for INSERT/UPDATE).
+	•	ACTION_TIMESTAMP: When the action happened.
+
+13. Troubleshooting
+	1.	Cannot Delete a Rule
+	•	Ensure it’s INACTIVE and APPROVAL_STATUS=APPROVED.
+	•	Make sure it has no active child rules or references in BRM_COLUMN_MAPPING.
+	2.	Cannot Delete a Group
+	•	Confirm no users are assigned to the group.
+	•	If the group has associated rules, ensure they’re assigned to a different OWNER_GROUP first or delete those rules.
+	3.	Approvals Not Advancing
+	•	Check if all current-stage approvers have approved the rule.
+	•	Ensure the rule’s APPROVAL_STATUS is still APPROVAL_IN_PROGRESS. If all are approved, it becomes APPROVED.
+	4.	Lineage Graph Doesn’t Show All Changes
+	•	Click “Refresh Graph” in the Lineage Visualization tab to reload the latest data.
+	•	Make sure your rules were saved or updated properly.
+	5.	Foreign Key Error
+	•	This usually occurs if you attempt to reference a non-existent record or delete an entity that still has child references. Check the related entities or reassign them first.
+
+14. Best Practices and Tips
+	•	Run the Application Regularly: Because the database is in-memory by default, data resets each time you close the tool unless you modify the DB_URI to point to a file-based SQLite DB.
+	•	Use Backup and Restore: If you care about the changes persisting, make frequent backups of your groups or custom groups, especially before major modifications.
+	•	Keep Credentials Secure: If you introduce new users, ensure you don’t store passwords in plain text for production usage. (The demo uses plain text for illustration.)
+	•	Don’t Rely on Work-In-Progress Approvals: If a rule is partially approved, do not forcibly set it to ACTIVE. The system’s multi-step approval logic automatically determines when a rule is fully approved.
+
+15. Conclusion
+
+The BRM Tool integrates robust data integrity (via application-level checks and foreign key constraints), audit logging, and a rich UI for business rule management. By following the steps in this guide, you should be able to:
+	1.	Log in and manage business rules.
+	2.	Create or update rules with enforced approvals.
+	3.	Backup and restore groups or custom rule groups.
+	4.	Visualize rule lineage and dependencies.
+	5.	Use advanced functionalities like multi-step approvals and global/critical rule administration.
+
+If you have any questions, issues, or enhancement requests, refer to the Troubleshooting section first, or consult with your system administrator or development team.
+
+Happy rule management!
