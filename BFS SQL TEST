@@ -1,0 +1,217 @@
+Below are three “complex” SQL-based rules you can enter under “Business Rule Management” → “Add Rule” in your BRM tool. Together, they demonstrate:
+	•	Multi-step approvals (none of these rules are global).
+	•	A chain of parent → child → grandchild for lineage (you’ll see them lined up in the “Lineage Visualization” tab).
+	•	BFS pass/fail logic (some rules return a single row: 0 for fail, 1 for pass).
+	•	Critical skipping logic (one rule is critical, so if it fails, the child is skipped).
+	•	INSERT statements that return no row—which your BFS treats as pass (row=None ⇒ pass).
+
+You’ll see references to an employees table, checking salary thresholds and outliers, then finally an insert to final_salaries.
+
+Feel free to adapt table names/column names to match your environment (these are purely to test the BRM’s features).
+
+Rule #1: Check Average Salary
+	1.	Name:
+
+Check Average Salary
+
+
+	2.	Owner Group:
+
+BG1
+
+(or whichever group you prefer)
+
+	3.	Parent Rule:
+
+None
+
+(this is the root rule in the pipeline)
+
+	4.	Rule SQL:
+
+SELECT CASE WHEN AVG(salary) > 50000 THEN 1 ELSE 0 END
+FROM employees;
+
+	•	The BFS picks up FROM employees as a dependency.
+	•	It returns 1 if the average salary is above 50k (PASS), 0 otherwise (FAIL).
+
+	5.	Rule Type:
+
+DQ
+
+(or whichever type: DM, etc.)
+
+	6.	Effective Start:
+
+2025-01-01 00:00:00
+
+
+	7.	Effective End:
+
+2025-12-31 23:59:59
+
+
+	8.	Global: Unchecked
+	9.	Critical: Unchecked
+	10.	Operation Type:
+
+SELECT
+
+	11.	Description / Justification:
+
+Checking if avg salary exceeds 50k to pass or fail. 
+Demonstrates BFS pass/fail and table reference “employees.”
+
+Why it’s helpful:
+	•	As a root rule, BFS will run it first. If the avg salary is above 50k => returns 1 => PASS. If not => returns 0 => FAIL.
+	•	Also gives a lineage starting point in “Lineage Visualization.”
+
+Rule #2: Check Salary Outliers
+	1.	Name:
+
+Check Salary Outliers
+
+
+	2.	Owner Group:
+
+BG1
+
+
+	3.	Parent Rule:
+
+Check Average Salary
+
+	•	Select Rule #1 as its parent, establishing BFS and lineage from #1 → #2.
+
+	4.	Rule SQL:
+
+SELECT CASE WHEN (MAX(salary) - MIN(salary)) <= 80000 
+           THEN 1 
+           ELSE 0 
+       END
+FROM employees;
+
+	•	The BFS sees FROM employees.
+	•	Returns 1 if the salary range is ≤ 80k => PASS, else 0 => FAIL.
+
+	5.	Rule Type:
+
+DQ
+
+
+	6.	Effective Start:
+
+2025-01-01 00:00:00
+
+
+	7.	Effective End:
+
+2025-12-31 23:59:59
+
+
+	8.	Global: Unchecked
+	9.	Critical: Checked
+	10.	Critical Scope:
+
+GROUP
+
+	•	If this rule fails, BFS skips all child rules in the same BG1.
+
+	11.	Operation Type:
+
+SELECT
+
+	12.	Description / Justification:
+
+Checking if employees have a large outlier range. 
+If outlier range is >80k => fails. 
+This is set CRITICAL=>GROUP, so child rules are skipped if fail.
+
+Why it’s helpful:
+	•	It’s Critical with scope “GROUP.” If it fails BFS, any child rule in BG1 is skipped.
+	•	Also references employees again, but with a different pass/fail condition.
+	•	Extends the pipeline from #1 → #2.
+
+Rule #3: Insert Final Salaries
+	1.	Name:
+
+Insert Final Salaries
+
+
+	2.	Owner Group:
+
+BG1
+
+
+	3.	Parent Rule:
+
+Check Salary Outliers
+
+	•	This makes a BFS chain #1 → #2 → #3.
+
+	4.	Rule SQL:
+
+INSERT INTO final_salaries(emp_id, salary)
+SELECT emp_id, salary 
+FROM employees 
+WHERE salary > 50000;
+
+	•	No row is returned by an INSERT statement in SQLite by default (unless you use advanced returning syntax). Therefore BFS sees row=None => passes automatically.
+	•	The naive parser picks up FROM employees.
+
+	5.	Rule Type:
+
+DM
+
+(just to differentiate from the first two)
+
+	6.	Effective Start:
+
+2025-01-01 00:00:00
+
+
+	7.	Effective End:
+
+2025-12-31 23:59:59
+
+
+	8.	Global: Unchecked
+	9.	Critical: Unchecked
+	10.	Operation Type:
+
+INSERT
+
+	11.	Description / Justification:
+
+Move employees with salary>50k into final_salaries table. 
+Tests BFS “no row => pass” logic, also child of a critical rule (#2).
+
+Why it’s helpful:
+	•	The BFS code sees an INSERT that returns no row → BFS interprets row=None => PASS.
+	•	If Rule #2 fails (0 returned), BFS will skip #3 because #2 is critical with group scope.
+	•	You’ll see a final node in lineage #2 → #3 referencing “employees” table again.
+
+Summary of This Mini-Pipeline
+	1.	Rule #1: “Check Average Salary” (root)
+	•	If avg(salary) ≤ 50k => fails BFS => any child is skipped.
+	•	If pass => BFS proceeds to next.
+	2.	Rule #2: “Check Salary Outliers” (Critical)
+	•	If the salary range is more than 80k => returns 0 => BFS fails => it’s critical => child (#3) is skipped.
+	•	If pass => BFS continues to #3.
+	3.	Rule #3: “Insert Final Salaries” (Child of #2)
+	•	The BFS sees no row returned from INSERT ..., interprets that as pass => success.
+	•	If #2 had failed, #3 would never run and gets skipped due to the parent being critical.
+
+Testing All Features
+	1.	Multi-step Approvals: Because none are global, they each require approvals. You’ll see them in “Approvals” for group BG1.
+	2.	Lineage: The BFS adjacency is #1 → #2 → #3; you’ll see that chain in the “Lineage Visualization” tab. Right-click a node → highlight ancestors/descendants.
+	3.	Column Mappings:
+	•	Optionally, you can add column mappings in the “Control Tables” → BRM_COLUMN_MAPPING to specify how columns in employees map to final_salaries.
+	4.	BFS Execution:
+	•	“Run ETL (Execute Rules)” from the dashboard.
+	•	#1 checks if avg(salary) > 50k => pass/fail. If pass => #2 checks outlier range => pass/fail. If #2 fails => skip #3. If #2 passes => #3 performs the INSERT => BFS sees no row => pass.
+	5.	Critical: #2 is critical with scope GROUP. If it fails, #3 is skipped.
+	6.	Operation Types: #1 & #2 are “SELECT,” #3 is “INSERT” with no returned row.
+	7.	Audit Logs: Any add/update actions show up in the “Audit Log Viewer.”
+
+With these slightly more complex rules referencing employees data (like averages, outlier checks, and an insert to final_salaries), you’ll get full coverage: BFS pass/fail, skipping on critical fail, lineage chain, multi-step approvals, and the “no row => pass” scenario. Enjoy!
