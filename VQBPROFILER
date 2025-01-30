@@ -13,10 +13,8 @@
 #  - DML modes (SELECT/INSERT/UPDATE/DELETE) + column mapping lines
 #  - "SQL Import" => partial canvas rebuild using sqlglot (no "ansi")
 #  - *No forced LIMIT* in run_sql
-#  - No pan/zoom on the canvas
-#  - **Integrated Data Profiler** to do quick aggregate stats on a chosen table.
-#
-# Requires: pyodbc, sqlparse, sqlglot, PyQt5
+#  - No pan/zoom on the canvas (no setDragMode, no wheelEvent override).
+#  - **Integrated Data Profiler** with safe checks (skips BFS/subqueries, try/except queries)
 
 import sys
 import traceback
@@ -80,9 +78,8 @@ def apply_fusion_style():
     """
     QApplication.instance().setStyleSheet(style_sheet)
 
-
 ###############################################################################
-# 2) ODBCConnectDialog
+# 2) ODBCConnectDialog (Teradata)
 ###############################################################################
 class ODBCConnectDialog(QDialog):
     def __init__(self, parent=None):
@@ -149,7 +146,6 @@ class ODBCConnectDialog(QDialog):
 
     def get_db_type(self):
         return self._db_type
-
 
 ###############################################################################
 # 3) Lazy schema loading + foreign key map
@@ -224,7 +220,6 @@ def load_columns_for_table(connection, dbN, tblN):
     except Exception as ex:
         logging.warning(f"Failed to load columns for {dbN}.{tblN}: {ex}")
     return cols
-
 
 ###############################################################################
 # 4) LazySchemaTreeWidget
@@ -387,7 +382,6 @@ class SQLHighlighter(QSyntaxHighlighter):
                 self.setFormat(st, ln, fmt)
         self.setCurrentBlockState(0)
 
-
 ###############################################################################
 # 6) ColumnJoinWizard, MappingLine, JoinLine
 ###############################################################################
@@ -539,7 +533,6 @@ class JoinLine(QGraphicsLineItem):
         self.update_line()
         super().hoverLeaveEvent(e)
 
-
 ###############################################################################
 # 7) Collapsible BFS item & Collapsible Table items
 ###############################################################################
@@ -632,7 +625,6 @@ class CollapsibleBFSGraphicsItem(QGraphicsRectItem):
             if chk:
                 arr.append(ct.toPlainText().strip())
         return arr
-
 
 class DraggableColumnTextItem(QGraphicsTextItem):
     def __init__(self, parent_table_item, column_name, column_type):
@@ -837,9 +829,8 @@ class CollapsibleTableGraphicsItem(QGraphicsRectItem):
                 sel.append(f"{self.table_fullname}.{colName}")
         return sel
 
-
 ###############################################################################
-# 8) Nested subqueries & sub-VQB
+# 8) Nested subqueries & Sub-VQB
 ###############################################################################
 class NestedVQBDialog(QDialog):
     def __init__(self, existing_sql="", parent_builder=None, parent=None):
@@ -851,7 +842,6 @@ class NestedVQBDialog(QDialog):
         self.result_sql=""
 
         layout=QVBoxLayout(self)
-        from_copy = None
         from_copy = VisualQueryBuilderTab()
         self.sub_vqb = from_copy
         layout.addWidget(self.sub_vqb)
@@ -930,7 +920,6 @@ class SubVQBDialog(QDialog):
         op_h.addStretch()
         lay.addLayout(op_h)
 
-        from_copy = None
         from_copy = VisualQueryBuilderTab()
         self.sub_vqb = from_copy
         lay.addWidget(self.sub_vqb)
@@ -956,7 +945,6 @@ class SubVQBDialog(QDialog):
 
     def getResult(self):
         return (self.operator, self.second_sql)
-
 
 ###############################################################################
 # 9) Expression Builder & Window Function Wizard
@@ -1199,6 +1187,9 @@ class AdvancedExpressionBuilderDialog(QDialog):
         expr=" ".join(self.expression_tokens)
         return (self.alias, expr)
 
+###############################################################################
+# 10) Filter Panel (WHERE/HAVING)
+###############################################################################
 class AddFilterDialog(QDialog):
     def __init__(self, available_columns, parent=None):
         super().__init__(parent)
@@ -1321,6 +1312,9 @@ class FilterPanel(QGroupBox):
             arr.append((col,op,val))
         return arr
 
+###############################################################################
+# 11) GroupBy & Pivot & Aggregates
+###############################################################################
 class PivotDialog(QDialog):
     def __init__(self, available_cols, parent=None):
         super().__init__(parent)
@@ -1519,6 +1513,9 @@ class GroupByPanel(QGroupBox):
             ags.append((f,c,a))
         return ags
 
+###############################################################################
+# 12) Sort & Limit Panel
+###############################################################################
 class SortLimitPanel(QGroupBox):
     def __init__(self,builder,parent=None):
         super().__init__("Sort & Limit",parent)
@@ -1621,6 +1618,9 @@ class SortLimitPanel(QGroupBox):
         v=self.offset_spin.value()
         return v if v>0 else None
 
+###############################################################################
+# 13) SQLImportTab => parse with sqlglot parse_one (no "ansi")
+###############################################################################
 class SQLImportTab(QWidget):
     def __init__(self, builder=None, parent=None):
         super().__init__(parent)
@@ -1668,6 +1668,9 @@ class SQLImportTab(QWidget):
         self.builder.import_and_rebuild_canvas(expr, raw_sql)
         QMessageBox.information(self,"Import OK","Canvas has been rebuilt from the SQL.")
 
+###############################################################################
+# 14) CTE Panel => "virtual tables" on the canvas
+###############################################################################
 class CTEDialog(QDialog):
     def __init__(self, parent_builder, existing_name="", existing_sql="", parent=None):
         super().__init__(parent)
@@ -1685,9 +1688,9 @@ class CTEDialog(QDialog):
         layout.addLayout(form)
 
         from_copy = VisualQueryBuilderTab()
-        self.sub_vqb = from_copy
         if hasattr(self.builder_ref, 'connections'):
-            self.sub_vqb.set_connections(self.builder_ref.connections)
+            from_copy.set_connections(self.builder_ref.connections)
+        self.sub_vqb = from_copy
         layout.addWidget(self.sub_vqb)
 
         if self.cte_sql.strip():
@@ -1815,12 +1818,16 @@ class CTEPanel(QGroupBox):
             out.append((n,s))
         return out
 
+###############################################################################
+# 15) EnhancedCanvasGraphicsView => BFS multi-join & DML line
+###############################################################################
 class EnhancedCanvasGraphicsView(QGraphicsView):
     def __init__(self, builder, parent=None):
         super().__init__(parent)
         self.builder=builder
         self.scene_ = QGraphicsScene(self)
         self.setScene(self.scene_)
+        # No pan/zoom
         self.table_items={}
         self.join_lines=[]
         self.mapping_lines=[]
@@ -1917,7 +1924,9 @@ class EnhancedCanvasGraphicsView(QGraphicsView):
         for ml in self.mapping_lines:
             ml.update_pos()
 
-
+###############################################################################
+# 16) ResultDataDialog
+###############################################################################
 class ResultDataDialog(QDialog):
     def __init__(self, rows, columns, parent=None):
         super().__init__(parent)
@@ -1931,20 +1940,19 @@ class ResultDataDialog(QDialog):
                 it=QTableWidgetItem(str(val))
                 tbl.setItem(r_idx,c_idx,it)
         main.addWidget(tbl)
+
         btns=QDialogButtonBox(QDialogButtonBox.Ok)
         btns.accepted.connect(self.accept)
         main.addWidget(btns)
         self.setLayout(main)
 
 ###############################################################################
-#  New  - DataProfilerDialog
+# 17) DataProfilerDialog
 ###############################################################################
 class DataProfilerDialog(QDialog):
     """
-    A data profiler that runs simple queries on a chosen table in the canvas:
-    - For each column, we do: 
-       COUNT(*), COUNT(DISTINCT col)
-       If numeric => MIN(col), MAX(col), AVG(col)
+    Minimal data profiler that runs simple queries on a chosen table:
+      - COUNT(*), COUNT(DISTINCT), MIN, MAX, AVG
     """
     def __init__(self, table_name, columns, connection, parent=None):
         super().__init__(parent)
@@ -1955,15 +1963,14 @@ class DataProfilerDialog(QDialog):
         self.resize(800,400)
 
         layout = QVBoxLayout(self)
-
         info = QLabel(
             f"Profiling {table_name}.\n"
-            "We run a few aggregate queries per column.\n"
-            "This is a minimal example; extend as you like."
+            "For each column, we do COUNT(*), COUNT(DISTINCT), plus MIN/MAX/AVG if no errors.\n"
+            "If a query fails, we show 'ERR'."
         )
         layout.addWidget(info)
 
-        self.prof_table = QTableWidget(0,6)  # colName, count, distinct, min, max, avg
+        self.prof_table = QTableWidget(0,6)
         self.prof_table.setHorizontalHeaderLabels(
             ["Column","COUNT","DISTINCT","MIN","MAX","AVG"]
         )
@@ -1972,99 +1979,81 @@ class DataProfilerDialog(QDialog):
         btns = QDialogButtonBox(QDialogButtonBox.Ok)
         layout.addWidget(btns)
         btns.accepted.connect(self.accept)
-
         self.setLayout(layout)
 
-        # run the profiler
         self.run_profiler()
 
     def run_profiler(self):
-        """
-        For each column, do:
-          SELECT COUNT(*),
-                 COUNT(DISTINCT col),
-                 MIN(col), MAX(col), AVG(col)
-          if numeric
-        """
         if not self.connection:
             QMessageBox.warning(self,"No Connection","Cannot profile with no DB connection.")
             return
-
-        # We'll use pyodbc type info to guess numeric vs. text
-        # For minimal example, let's assume anything we can do MIN,MAX,AVG on we do them.
         c = self.connection.cursor()
-        # We'll add rows to self.prof_table
+
         self.prof_table.setRowCount(0)
+        if "." not in self.table_name:
+            QMessageBox.warning(self,"Invalid Table",f"Table name '{self.table_name}' is not valid.")
+            return
 
+        # For each column => do queries
         for col in self.columns:
-            # col is "dbN.tblN.colN"
-            # we only want the actual column part
-            # or we can do direct query
-            # The table_name is e.g. "dbN.tblN"
             short_col = col.split(".")[-1]
-            # We do a naive attempt at numeric or not:
-            # We'll query top 1 row's type:
-            # or we can try a SELECT with try/except
-
-            # For demonstration, let's do:
-            # SELECT COUNT(*), COUNT(DISTINCT short_col) FROM table
-            # Then try MIN(...) etc. If it fails => skip
-
             rowIndex = self.prof_table.rowCount()
             self.prof_table.insertRow(rowIndex)
             self.prof_table.setItem(rowIndex, 0, QTableWidgetItem(short_col))
 
             # COUNT(*)
             sql_count = f"SELECT COUNT(*) FROM {self.table_name}"
+            cc="ERR"
             try:
                 c.execute(sql_count)
-                cc = c.fetchone()[0]
+                row = c.fetchone()
+                if row:
+                    cc=row[0]
             except:
-                cc = "ERR"
-            self.prof_table.setItem(rowIndex, 1, QTableWidgetItem(str(cc)))
+                pass
+            self.prof_table.setItem(rowIndex,1,QTableWidgetItem(str(cc)))
 
             # COUNT DISTINCT
             sql_dist = f"SELECT COUNT(DISTINCT {short_col}) FROM {self.table_name}"
+            cd="ERR"
             try:
                 c.execute(sql_dist)
-                cd = c.fetchone()[0]
+                row=c.fetchone()
+                if row:
+                    cd=row[0]
             except:
-                cd = "ERR"
-            self.prof_table.setItem(rowIndex, 2, QTableWidgetItem(str(cd)))
+                pass
+            self.prof_table.setItem(rowIndex,2,QTableWidgetItem(str(cd)))
 
-            # MIN, MAX, AVG => try them individually
-            # If error => skip
+            # MIN, MAX, AVG
             minv="N/A"
+            maxv="N/A"
+            avgv="N/A"
             try:
-                sql_min=f"SELECT MIN({short_col}) FROM {self.table_name}"
-                c.execute(sql_min)
-                mv=c.fetchone()[0]
-                if mv is not None:
-                    minv=str(mv)
+                c.execute(f"SELECT MIN({short_col}) FROM {self.table_name}")
+                r=c.fetchone()
+                if r and r[0] is not None:
+                    minv=str(r[0])
                 else:
                     minv="NULL"
             except:
                 minv="ERR"
 
-            maxv="N/A"
             try:
-                sql_max=f"SELECT MAX({short_col}) FROM {self.table_name}"
-                c.execute(sql_max)
-                mv=c.fetchone()[0]
-                if mv is not None:
-                    maxv=str(mv)
+                c.execute(f"SELECT MAX({short_col}) FROM {self.table_name}")
+                r=c.fetchone()
+                if r and r[0] is not None:
+                    maxv=str(r[0])
                 else:
                     maxv="NULL"
             except:
                 maxv="ERR"
 
-            avgv="N/A"
             try:
-                sql_avg=f"SELECT AVG({short_col}) FROM {self.table_name}"
-                c.execute(sql_avg)
-                mv=c.fetchone()[0]
-                if mv is not None:
-                    avgv=str(mv)
+                c.execute(f"SELECT AVG({short_col}) FROM {self.table_name}")
+                r=c.fetchone()
+                if r and r[0] is not None:
+                    avgv=str(r[0])
                 else:
                     avgv="NULL"
             except:
@@ -2074,6 +2063,9 @@ class DataProfilerDialog(QDialog):
             self.prof_table.setItem(rowIndex,4,QTableWidgetItem(maxv))
             self.prof_table.setItem(rowIndex,5,QTableWidgetItem(avgv))
 
+###############################################################################
+# 18) The main VQB tab => includes BFS for DML + no forced LIMIT
+###############################################################################
 class VisualQueryBuilderTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2088,6 +2080,7 @@ class VisualQueryBuilderTab(QWidget):
     def init_ui(self):
         main=QVBoxLayout(self)
 
+        # connection row
         conn_h=QHBoxLayout()
         self.status_light=QFrame()
         self.status_light.setFixedSize(15,15)
@@ -2103,9 +2096,11 @@ class VisualQueryBuilderTab(QWidget):
         self.auto_chk.setChecked(True)
         self.auto_chk.stateChanged.connect(self.on_auto_gen_changed)
         conn_h.addWidget(self.auto_chk)
+
         conn_h.addStretch()
         main.addLayout(conn_h)
 
+        # operation row
         tb_h=QHBoxLayout()
         ref_btn=QPushButton("Refresh Schema")
         ref_btn.clicked.connect(self.refresh_schema)
@@ -2268,6 +2263,7 @@ class VisualQueryBuilderTab(QWidget):
         conn=self.connections[first_key]["connection"]
         try:
             c=conn.cursor()
+            # Not forcing a LIMIT => user’s query is run as-is
             c.execute(sql)
             rows=c.fetchall()
             cols=[desc[0] for desc in c.description] if c.description else []
@@ -2436,6 +2432,7 @@ class VisualQueryBuilderTab(QWidget):
     def generate_sql(self):
         if not self.auto_generate:
             return
+
         if self.operation_mode=="INSERT":
             body_sql=self._generate_insert()
         elif self.operation_mode=="UPDATE":
@@ -2672,33 +2669,23 @@ class VisualQueryBuilderTab(QWidget):
                 self.cte_panel._add_cte_row(cName,cSQL)
             main_expr=root_expr.this
 
+        # If the main is not a simple SELECT => we just show it in the SQL
         if not isinstance(main_expr, exp.Select):
             self.sql_display.setPlainText(full_sql)
             self.validate_sql()
             return
 
+        # else we set final text
         self.sql_display.setPlainText(full_sql)
         self.validate_sql()
 
-
 ###############################################################################
-#  Add a Data Profiler
-###############################################################################
-class DataProfilerDialog(QDialog):
-    """
-    A simple data profiler that:
-      - For each column, does COUNT, DISTINCT, (MIN/MAX/AVG if numeric).
-      - Displays them in a table.
-    """
-    # Already declared above in the same file
-
-###############################################################################
-# 18) MainVQBWindow => Our top-level PyQt app
+# 19) MainVQBWindow => top-level PyQt app with integrated data profiler
 ###############################################################################
 class MainVQBWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("VQB with Column-to-Column Joins + Data Profiler")
+        self.setWindowTitle("VQB with Column-to-Column Joins + Data Profiler (All-In-One)")
         self.resize(1200,800)
         self.builder_tab=VisualQueryBuilderTab()
         self.setCentralWidget(self.builder_tab)
@@ -2719,7 +2706,7 @@ class MainVQBWindow(QMainWindow):
         map_act.triggered.connect(self.demo_map)
         tb.addAction(map_act)
 
-        # **** NEW: Data Profiler
+        # Data Profiler Action
         profile_act=QAction("Data Profiler", self)
         profile_act.triggered.connect(self.run_data_profiler)
         tb.addAction(profile_act)
@@ -2771,46 +2758,43 @@ class MainVQBWindow(QMainWindow):
 
     def run_data_profiler(self):
         """
-        Let user pick a table from the canvas, then do a simple data profile:
-        - We pass that table name + columns to DataProfilerDialog
-        - Query the DB for count, distinct, etc.
+        Let user pick a real table from the canvas => run DataProfilerDialog on it.
+        We skip BFS or subqueries by ensuring "." in the table name and "columns" exist.
         """
         if not self.builder_tab.connections:
             QMessageBox.information(self,"No Connection","No DB connection.")
             return
-        # We'll gather a list of table keys from self.builder_tab.canvas.table_items
-        table_keys = []
+
+        # gather real tables from the canvas
+        table_keys=[]
         for k,v in self.builder_tab.canvas.table_items.items():
-            # only pick real tables or cte, skip BFS or subquery items
-            if hasattr(v,"columns") and hasattr(v,"table_fullname"):
-                # e.g. "dbName.tblName"
+            if hasattr(v,"columns") and "." in k:
                 table_keys.append(k)
 
         if not table_keys:
-            QMessageBox.information(self,"No Tables","No real tables on canvas.")
+            QMessageBox.information(self,"No Tables","No real database tables on the canvas.")
             return
-        # let user pick
-        (chosen_table, ok) = QtWidgets.QInputDialog.getItem(
-            self, "Pick Table", "Choose a table to profile:", table_keys, 0, False
+
+        (chosen_table, ok)=QtWidgets.QInputDialog.getItem(
+            self,"Pick Table","Choose a table to profile:", table_keys,0,False
         )
         if not ok or not chosen_table:
             return
 
-        # get columns for it
-        table_item = self.builder_tab.canvas.table_items.get(chosen_table)
+        table_item=self.builder_tab.canvas.table_items.get(chosen_table)
         if not table_item or not hasattr(table_item,"columns"):
-            QMessageBox.information(self,"Not Found","No columns found for chosen table.")
+            QMessageBox.information(self,"No columns","Could not retrieve columns for that table.")
             return
-        columns = []
-        for c in table_item.columns:
-            columns.append(f"{chosen_table}.{c}")
 
-        # pick first DB connection
         first_key=list(self.builder_tab.connections.keys())[0]
         conn=self.builder_tab.connections[first_key]["connection"]
+        # build "db.tbl.col"
+        full_cols=[]
+        for c in table_item.columns:
+            full_cols.append(f"{chosen_table}.{c}")
 
-        prof_dlg = DataProfilerDialog(chosen_table, columns, conn, self)
-        prof_dlg.exec_()
+        dlg=DataProfilerDialog(chosen_table, full_cols, conn, self)
+        dlg.exec_()
 
 def main():
     app=QApplication(sys.argv)
