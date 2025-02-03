@@ -1,29 +1,32 @@
 #!/usr/bin/env python3
-# final_vqb_no_gaps.py
+# vqb_full.py
 #
-# A single-file Python/PyQt advanced Visual Query Builder for Teradata, featuring:
-#  - ODBC connection (no repeated reconnects)
-#  - Lazy schema (DB->Tables->Columns) with BFS multi-join, auto-FK, manual join
-#  - Collapsible table items (checkable columns) + sticky lines
-#  - Nested subquery items (double-click -> sub-VQB)
-#  - Combine Query (UNION, etc.) reusing connection
-#  - DML placeholders (INSERT/UPDATE/DELETE) + red partition line
-#       + “Complex Query” rectangle for BFS columns + target table + sticky mapping lines
-#  - Filter (WHERE/HAVING), GroupBy + pivot wizard, Sort/Limit
-#  - Advanced expression builder (multi-line text, subquery tokens, CASE wizard, snippets)
-#  - Run SQL => fetch up to 10 rows for user to preview
-#  - Import SQL => parse with sqlparse
-#  - Single file, no “same approach” placeholders or references
+# Single-file PyQt5 Visual Query Builder ("full VQB") featuring:
+#  - Multiple ODBC connections (alias = DSN name)
+#  - BFS (canvas) with multi-join lines
+#  - Mark any BFS item as DML Target for INSERT/UPDATE/DELETE mappings
+#  - Filter/Group/Sort/CTE panels + Pivot Wizard + Window Function Wizard
+#  - Token-based Advanced Expression Builder (CASE wizard, subquery insertion)
+#  - Data Profiler (counts, distinct, min, max, avg, boxplot outliers)
+#  - SQL Import with sqlglot => partial BFS rebuild
+#  - Cross-DB rewriting via Linked Server config
+#  - No dummy placeholders for BFS source/target
+#
+# Requirements:
+#   pip install pyqt5 pyodbc sqlparse sqlglot matplotlib
+#
 
 import sys
 import traceback
 import logging
 import pyodbc
 import sqlparse
+import sqlglot
+from sqlglot import exp
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import (
-    Qt, QPointF, QTimer, QThreadPool, QRunnable, pyqtSignal, QObject,
+    Qt, QTimer, QThreadPool, QRunnable, pyqtSignal, QObject,
     QRegularExpression
 )
 from PyQt5.QtGui import (
@@ -37,11 +40,16 @@ from PyQt5.QtWidgets import (
     QGraphicsScene, QGraphicsRectItem, QGraphicsTextItem, QGraphicsItem,
     QGraphicsLineItem, QProgressBar, QDialogButtonBox, QStatusBar,
     QGroupBox, QAbstractItemView, QSpinBox, QMenu, QFrame, QAction,
-    QListWidget, QCheckBox
+    QListWidget, QCheckBox, QHeaderView
 )
 
+import matplotlib
+matplotlib.use("Agg")  # Avoid needing a display environment
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+from matplotlib.figure import Figure
+
 ###############################################################################
-# LOGGING & ODBC
+# Logging + Fusion Style
 ###############################################################################
 logging.basicConfig(
     filename="vqb.log",
@@ -51,295 +59,470 @@ logging.basicConfig(
 )
 pyodbc.pooling = True
 
-###############################################################################
-# 1) Apply Fusion style
-###############################################################################
 def apply_fusion_style():
     QApplication.setStyle("Fusion")
-    pal=QPalette()
-    pal.setColor(QPalette.Window, QColor(240,240,240))
-    pal.setColor(QPalette.WindowText, Qt.black)
-    pal.setColor(QPalette.Base, QColor(255,255,255))
-    pal.setColor(QPalette.AlternateBase, QColor(225,225,225))
-    pal.setColor(QPalette.ToolTipBase, Qt.yellow)
-    pal.setColor(QPalette.ToolTipText, Qt.black)
-    pal.setColor(QPalette.Button, QColor(230,230,230))
-    pal.setColor(QPalette.ButtonText, Qt.black)
-    pal.setColor(QPalette.Highlight, QColor(76,163,224))
-    pal.setColor(QPalette.HighlightedText, Qt.white)
-    QApplication.setPalette(pal)
+    palette = QPalette()
+    palette.setColor(QPalette.Window, QColor(240,240,240))
+    palette.setColor(QPalette.WindowText, Qt.black)
+    palette.setColor(QPalette.Base, QColor(255,255,255))
+    palette.setColor(QPalette.AlternateBase, QColor(225,225,225))
+    palette.setColor(QPalette.Button, QColor(230,230,230))
+    palette.setColor(QPalette.ButtonText, Qt.black)
+    palette.setColor(QPalette.Highlight, QColor(76,163,224))
+    palette.setColor(QPalette.HighlightedText, Qt.white)
+    QApplication.setPalette(palette)
 
-    style_sheet="""
+    style_sheet = """
         QCheckBox::indicator, QRadioButton::indicator {
-            width:12px;
-            height:12px;
-            spacing:2px;
+            width: 12px;
+            height: 12px;
+            spacing: 2px;
         }
     """
     QApplication.instance().setStyleSheet(style_sheet)
 
 ###############################################################################
-# 2) ODBCConnectDialog
+# ODBC + Connections
 ###############################################################################
 class ODBCConnectDialog(QDialog):
-    """
-    Connect to Teradata DSN with optional user/pass.
-    """
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._conn=None
-        self._db_type=None
-        self.setWindowTitle("Connect to Teradata (ODBC)")
+        self.setWindowTitle("Connect to ODBC")
         self.resize(400,230)
+        self._conn = None
+        self._db_type = None
+        self._dsn_name= None
 
-        lay=QVBoxLayout(self)
-        lay.addWidget(QLabel("Database Type (Fixed to Teradata):"))
-        self.dbtype_lab=QLabel("Teradata")
-        lay.addWidget(self.dbtype_lab)
-
-        lay.addWidget(QLabel("ODBC DSN (Teradata Only):"))
-        self.dsn_cb=QComboBox()
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("Pick an ODBC DSN:"))
+        self.dsn_combo = QComboBox()
         try:
-            dsn_map=pyodbc.dataSources()
-            for dsn in sorted(dsn_map.keys()):
-                self.dsn_cb.addItem(dsn)
+            dsns = pyodbc.dataSources()
+            for dsn in sorted(dsns.keys()):
+                self.dsn_combo.addItem(dsn)
         except:
             pass
-        lay.addWidget(self.dsn_cb)
+        lay.addWidget(self.dsn_combo)
 
         lay.addWidget(QLabel("Username (optional):"))
-        self.user_ed=QLineEdit()
-        lay.addWidget(self.user_ed)
+        self.user_edit = QLineEdit()
+        lay.addWidget(self.user_edit)
 
         lay.addWidget(QLabel("Password (optional):"))
-        self.pass_ed=QLineEdit()
-        self.pass_ed.setEchoMode(QLineEdit.Password)
-        lay.addWidget(self.pass_ed)
+        self.pass_edit = QLineEdit()
+        self.pass_edit.setEchoMode(QLineEdit.Password)
+        lay.addWidget(self.pass_edit)
 
-        btns=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
         lay.addWidget(btns)
         btns.accepted.connect(self.on_ok)
         btns.rejected.connect(self.reject)
         self.setLayout(lay)
 
     def on_ok(self):
-        dsn=self.dsn_cb.currentText().strip()
+        dsn = self.dsn_combo.currentText().strip()
         if not dsn:
-            QMessageBox.warning(self,"No DSN","Please pick a DSN.")
+            QMessageBox.warning(self, "No DSN", "Must pick a DSN.")
             return
-        conn_str=f"DSN={dsn};"
-        user=self.user_ed.text().strip()
-        pwd=self.pass_ed.text().strip()
+        user = self.user_edit.text().strip()
+        pwd  = self.pass_edit.text().strip()
+
+        conn_str = f"DSN={dsn};"
         if user:
-            conn_str+=f"UID={user};"
+            conn_str += f"UID={user};"
         if pwd:
-            conn_str+=f"PWD={pwd};"
+            conn_str += f"PWD={pwd};"
+
         try:
-            cn=pyodbc.connect(conn_str,autocommit=True)
-            self._conn=cn
-            self._db_type="Teradata"
+            cn = pyodbc.connect(conn_str, autocommit=True)
+            self._conn = cn
+            self._dsn_name = dsn
+            try:
+                dbms = cn.getinfo(pyodbc.SQL_DBMS_NAME) or ""
+                if "TERADATA" in dbms.upper():
+                    self._db_type = "Teradata"
+                elif "SQL SERVER" in dbms.upper():
+                    self._db_type = "SQLServer"
+                else:
+                    self._db_type = dbms.strip()
+            except:
+                self._db_type = "Unknown"
             self.accept()
         except Exception as ex:
             QMessageBox.critical(self,"Connect Error",f"Failed:\n{ex}")
 
     def get_connection(self):
         return self._conn
+
     def get_db_type(self):
         return self._db_type
 
-###############################################################################
-# 3) Lazy schema loading & foreign keys
-###############################################################################
-class LazySchemaWorkerSignals(QObject):
-    finished=pyqtSignal(list)
-    error=pyqtSignal(str)
+    def get_dsn_name(self):
+        return self._dsn_name
 
-class LazySchemaWorker(QRunnable):
-    def __init__(self, conn, dbName):
+class MultiODBCConnectDialog(QDialog):
+    """
+    We store connections in { alias: { "connection":..., "db_type":... }, ... }
+    alias = DSN or DSN_2, DSN_3 if duplicates
+    """
+    def __init__(self, existing_conns=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Manage DB Connections")
+        self.resize(500,300)
+        self._connections = existing_conns if existing_conns else {}
+
+        layout = QVBoxLayout(self)
+        instruct = QLabel("Add or Remove ODBC connections.\nAlias = DSN name.")
+        layout.addWidget(instruct)
+
+        self.conn_table = QTableWidget(0,3)
+        self.conn_table.setHorizontalHeaderLabels(["Alias(DSN)","DB Type","Status"])
+        self.conn_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.conn_table)
+
+        for alias, info in self._connections.items():
+            r = self.conn_table.rowCount()
+            self.conn_table.insertRow(r)
+            self.conn_table.setItem(r,0,QTableWidgetItem(alias))
+            self.conn_table.setItem(r,1,QTableWidgetItem(info.get("db_type","Unknown")))
+            st="OK" if info.get("connection") else "NoConn"
+            self.conn_table.setItem(r,2,QTableWidgetItem(st))
+
+        btn_h = QHBoxLayout()
+        add_b = QPushButton("Add Connection")
+        rm_b  = QPushButton("Remove Connection")
+        cls_b = QPushButton("Close")
+        btn_h.addWidget(add_b)
+        btn_h.addWidget(rm_b)
+        btn_h.addStretch()
+        btn_h.addWidget(cls_b)
+        layout.addLayout(btn_h)
+
+        add_b.clicked.connect(self.on_add)
+        rm_b.clicked.connect(self.on_rm)
+        cls_b.clicked.connect(self.accept)
+        self.setLayout(layout)
+
+    def on_add(self):
+        d = ODBCConnectDialog(self)
+        if d.exec_() == QDialog.Accepted:
+            c   = d.get_connection()
+            dbt = d.get_db_type()
+            dsn = d.get_dsn_name()
+            if c and dsn:
+                alias = dsn
+                count_ = 2
+                while alias in self._connections:
+                    alias = f"{dsn}_{count_}"
+                    count_ += 1
+                self._connections[alias] = {"connection":c,"db_type":dbt}
+                r=self.conn_table.rowCount()
+                self.conn_table.insertRow(r)
+                self.conn_table.setItem(r,0,QTableWidgetItem(alias))
+                self.conn_table.setItem(r,1,QTableWidgetItem(dbt))
+                self.conn_table.setItem(r,2,QTableWidgetItem("OK"))
+
+    def on_rm(self):
+        rows=self.conn_table.selectionModel().selectedRows()
+        if not rows:
+            return
+        for rr in sorted([x.row() for x in rows],reverse=True):
+            alias_item=self.conn_table.item(rr,0)
+            if alias_item:
+                alias=alias_item.text()
+                if alias in self._connections:
+                    del self._connections[alias]
+            self.conn_table.removeRow(rr)
+
+    def get_connections(self):
+        return self._connections
+
+###############################################################################
+# LinkedServer => cross DB rewriting
+###############################################################################
+class LinkedServerConfigDialog(QDialog):
+    def __init__(self, existing_map=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Linked Server / Federation Config")
+        self.resize(500,300)
+        self._map = existing_map.copy() if existing_map else {}
+
+        ly= QVBoxLayout(self)
+        instr= QLabel("Map each DSN alias to a 'linked server' name for cross-DB.\n"
+                      "'MyDSN.myDb.myTable' => '[LinkedSrv].[myDb].dbo.[myTable]'.")
+        ly.addWidget(instr)
+
+        self.tbl= QTableWidget(0,2)
+        self.tbl.setHorizontalHeaderLabels(["Alias(DSN)","LinkedServerName"])
+        self.tbl.horizontalHeader().setStretchLastSection(True)
+        ly.addWidget(self.tbl)
+
+        for alias,lsn in self._map.items():
+            r=self.tbl.rowCount()
+            self.tbl.insertRow(r)
+            self.tbl.setItem(r,0,QTableWidgetItem(alias))
+            self.tbl.setItem(r,1,QTableWidgetItem(lsn))
+
+        bh= QHBoxLayout()
+        addb= QPushButton("Add")
+        rmb= QPushButton("Remove")
+        cls= QPushButton("Close")
+        bh.addWidget(addb)
+        bh.addWidget(rmb)
+        bh.addStretch()
+        bh.addWidget(cls)
+        ly.addLayout(bh)
+
+        addb.clicked.connect(self.on_add)
+        rmb.clicked.connect(self.on_rm)
+        cls.clicked.connect(self.accept)
+        self.setLayout(ly)
+
+    def on_add(self):
+        r=self.tbl.rowCount()
+        self.tbl.insertRow(r)
+        self.tbl.setItem(r,0,QTableWidgetItem("MyDSN"))
+        self.tbl.setItem(r,1,QTableWidgetItem("LinkedSrvName"))
+
+    def on_rm(self):
+        rows=self.tbl.selectionModel().selectedRows()
+        if not rows: return
+        for rr in sorted([r.row() for r in rows],reverse=True):
+            self.tbl.removeRow(rr)
+
+    def accept(self):
+        newmap={}
+        for r in range(self.tbl.rowCount()):
+            aitem=self.tbl.item(r,0)
+            litem=self.tbl.item(r,1)
+            if aitem and litem:
+                alias=aitem.text().strip()
+                lsn=litem.text().strip()
+                if alias:
+                    newmap[alias]=lsn
+        self._map=newmap
+        super().accept()
+
+    def get_map(self):
+        return self._map
+
+###############################################################################
+# load_tables/load_columns => multi DB
+###############################################################################
+def load_tables(connection, db_type, db_name):
+    out=[]
+    if not connection:
+        return out
+    try:
+        cur= connection.cursor()
+        if "TERADATA" in db_type.upper():
+            q=f"SELECT TableName FROM DBC.TablesV WHERE DatabaseName='{db_name}' AND TableKind='T' ORDER BY TableName"
+            cur.execute(q)
+            rows= cur.fetchall()
+            out=[row[0].strip() for row in rows]
+        elif "SQLSERVER" in db_type.upper():
+            q= f"SELECT TABLE_NAME FROM {db_name}.INFORMATION_SCHEMA.TABLES ORDER BY TABLE_NAME"
+            cur.execute(q)
+            rows=cur.fetchall()
+            out=[row[0].strip() for row in rows]
+        else:
+            pass
+    except Exception as ex:
+        logging.warning(f"Failed to load tables for {db_name}: {ex}")
+    return out
+
+def load_columns(connection, db_type, db_name, tbl_name):
+    out=[]
+    if not connection:
+        return out
+    try:
+        cur= connection.cursor()
+        if "TERADATA" in db_type.upper():
+            q=f"SELECT ColumnName FROM DBC.ColumnsV WHERE DatabaseName='{db_name}' AND TableName='{tbl_name}' ORDER BY ColumnId"
+            cur.execute(q)
+            rows=cur.fetchall()
+            out=[row[0].strip() for row in rows]
+        elif "SQLSERVER" in db_type.upper():
+            q=f"SELECT COLUMN_NAME FROM {db_name}.INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='{tbl_name}' ORDER BY ORDINAL_POSITION"
+            cur.execute(q)
+            rows=cur.fetchall()
+            out=[row[0].strip() for row in rows]
+        else:
+            pass
+    except Exception as ex:
+        logging.warning(f"Failed to load columns for {db_name}.{tbl_name}: {ex}")
+    return out
+
+###############################################################################
+# Lazy schema tree
+###############################################################################
+class SchemaLoaderSignals(QtCore.QObject):
+    finished=pyqtSignal(str,list)
+    error=pyqtSignal(str,str)
+
+class SchemaLoader(QtCore.QRunnable):
+    def __init__(self, connection, db_type, db_name):
         super().__init__()
-        self.conn=conn
-        self.dbName=dbName
-        self.signals=LazySchemaWorkerSignals()
+        self.connection= connection
+        self.db_type= db_type
+        self.db_name= db_name
+        self.signals= SchemaLoaderSignals()
 
     @QtCore.pyqtSlot()
     def run(self):
         try:
-            c=self.conn.cursor()
-            c.execute(f"""
-            SELECT TableName
-            FROM DBC.TablesV
-            WHERE DatabaseName='{self.dbName}' AND TableKind='T'
-            ORDER BY TableName
-            """)
-            rows=c.fetchall()
-            tbls=[r[0] for r in rows]
-            self.signals.finished.emit(tbls)
+            tabs= load_tables(self.connection, self.db_type, self.db_name)
+            self.signals.finished.emit(self.db_name, tabs)
         except Exception as ex:
-            msg=f"Error loading tables for {self.dbName}: {ex}\n{traceback.format_exc()}"
-            self.signals.error.emit(msg)
+            err = f"{ex}\n{traceback.format_exc()}"
+            self.signals.error.emit(self.db_name, err)
 
-def load_foreign_keys(connection):
-    fk_map={}
-    try:
-        cu=connection.cursor()
-        cu.execute("""
-        SELECT 
-            ChildDatabaseName, ChildTableName, ChildKeyColumnName,
-            ParentDatabaseName, ParentTableName, ParentKeyColumnName
-        FROM DBC.All_RI_Children
-        """)
-        rows=cu.fetchall()
-        for r in rows:
-            cd=r.ChildDatabaseName.strip()
-            ct=r.ChildTableName.strip()
-            cc=r.ChildKeyColumnName.strip()
-            pd=r.ParentDatabaseName.strip()
-            pt=r.ParentTableName.strip()
-            pc=r.ParentKeyColumnName.strip()
-            child_key=f"{cd}.{ct}.{cc}"
-            parent_key=f"{pd}.{pt}.{pc}"
-            fk_map[child_key]=parent_key
-    except:
-        pass
-    return fk_map
-
-def load_columns_for_table(conn, dbN, tblN):
-    cols=[]
-    try:
-        c=conn.cursor()
-        c.execute(f"""
-        SELECT ColumnName
-        FROM DBC.ColumnsV
-        WHERE DatabaseName='{dbN}' AND TableName='{tblN}'
-        ORDER BY ColumnId
-        """)
-        rows=c.fetchall()
-        cols=[r[0] for r in rows]
-    except:
-        pass
-    return cols
-
-###############################################################################
-# 4) LazySchemaTreeWidget
-###############################################################################
-class LazySchemaTreeWidget(QTreeWidget):
-    def __init__(self, conn, parent_builder=None, parent=None):
+class MultiDBLazySchemaTreeWidget(QTreeWidget):
+    """
+    DSN alias => databases => tables => columns
+    """
+    def __init__(self, connections, parent_builder=None, parent=None):
         super().__init__(parent)
-        self.conn=conn
-        self.parent_builder=parent_builder
-        self.setHeaderHidden(True)
+        self.connections=connections
+        self.parent_builder= parent_builder
+        self.setHeaderHidden(False)
+        self.setColumnCount(1)
+        self.setHeaderLabel("Databases / Tables")
         self.setDragEnabled(True)
-        self.threadpool=QThreadPool.globalInstance()
-        self.populate_top()
+        self.threadpool= QThreadPool.globalInstance()
+        self.populate_roots()
 
-    def populate_top(self):
+    def populate_roots(self):
         self.clear()
-        root_txt="Not Connected"
-        if self.conn:
+        if not self.connections:
+            self.addTopLevelItem(QTreeWidgetItem(["No Connections"]))
+            return
+        for alias,info in self.connections.items():
+            top= QTreeWidgetItem([f"{alias} ({info.get('db_type','Unknown')})"])
+            top.setData(0, Qt.UserRole, ("connAlias", alias))
+            self.addTopLevelItem(top)
+            conn=info.get("connection")
+            dbt=info.get("db_type","")
+            if not conn:
+                top.addChild(QTreeWidgetItem(["(No connection)"]))
+                continue
             try:
-                dbms=self.conn.getinfo(pyodbc.SQL_DBMS_NAME).strip()
-                if "TERADATA" in dbms.upper():
-                    root_txt=dbms
-            except:
-                pass
-        root_item=QTreeWidgetItem([root_txt])
-        root_item.setData(0,Qt.UserRole,"conn")
-        self.addTopLevelItem(root_item)
-
-        if not self.conn:
-            return
-
-        db_list=[]
-        try:
-            c=self.conn.cursor()
-            c.execute("SELECT DISTINCT DatabaseName FROM DBC.TablesV ORDER BY DatabaseName")
-            rows=c.fetchall()
-            db_list=[r[0] for r in rows]
-        except Exception as ex:
-            QMessageBox.warning(self,"Error",f"Fetching DB list failed:\n{ex}")
-
-        if not db_list:
-            root_item.addChild(QTreeWidgetItem(["<No DB>"]))
-            return
-
-        for dbn in db_list:
-            db_item=QTreeWidgetItem([dbn])
-            db_item.setData(0,Qt.UserRole,"db")
-            db_item.setData(0,Qt.UserRole+1,False)
-            db_item.addChild(QTreeWidgetItem(["Loading..."]))
-            root_item.addChild(db_item)
-
-        self.expandItem(root_item)
+                c=conn.cursor()
+                if "TERADATA" in dbt.upper():
+                    c.execute("SELECT DISTINCT DatabaseName FROM DBC.TablesV ORDER BY DatabaseName")
+                    rows=c.fetchall()
+                    for row in rows:
+                        dbn=row[0].strip()
+                        dbi= QTreeWidgetItem([dbn])
+                        dbi.setData(0, Qt.UserRole, ("db",alias,dbn))
+                        dbi.setData(0, Qt.UserRole+1,False)
+                        dbi.addChild(QTreeWidgetItem(["Loading..."]))
+                        top.addChild(dbi)
+                elif "SQLSERVER" in dbt.upper():
+                    c.execute("SELECT name FROM sys.databases ORDER BY name")
+                    rows=c.fetchall()
+                    for row in rows:
+                        dbn=row[0].strip()
+                        dbi=QTreeWidgetItem([dbn])
+                        dbi.setData(0, Qt.UserRole, ("db",alias,dbn))
+                        dbi.setData(0, Qt.UserRole+1,False)
+                        dbi.addChild(QTreeWidgetItem(["Loading..."]))
+                        top.addChild(dbi)
+                else:
+                    top.addChild(QTreeWidgetItem(["(Unknown DB type)"]))
+            except Exception as ex:
+                top.addChild(QTreeWidgetItem([f"(Error: {ex})"]))
+        self.expandAll()
 
     def mouseDoubleClickEvent(self,e):
-        it=self.itemAt(e.pos())
+        it= self.itemAt(e.pos())
         if it:
-            self.try_expand_item(it)
+            d= it.data(0, Qt.UserRole)
+            if d and d[0]=="db":
+                loaded= it.data(0, Qt.UserRole+1)
+                if not loaded:
+                    it.takeChildren()
+                    alias, dbn= d[1], d[2]
+                    info= self.connections.get(alias)
+                    if info and info.get("connection"):
+                        c= info["connection"]
+                        dbt= info["db_type"]
+                        worker= SchemaLoader(c,dbt,dbn)
+                        def fin(dbase, tables):
+                            self.populate_tables(it, dbase, tables)
+                        def err(dbase, msg):
+                            QMessageBox.critical(self,"Schema Error",f"{dbase} => {msg}")
+                        worker.signals.finished.connect(fin)
+                        worker.signals.error.connect(err)
+                        self.threadpool.start(worker)
         super().mouseDoubleClickEvent(e)
 
-    def try_expand_item(self, it):
-        dt=it.data(0,Qt.UserRole)
-        loaded=it.data(0,Qt.UserRole+1)
-        if dt=="db" and not loaded:
-            it.takeChildren()
-            dbn=it.text(0)
-            worker=LazySchemaWorker(self.conn, dbn)
-            def on_finish(tbls):
-                self.populate_db_node(it,tbls)
-            def on_error(msg):
-                QMessageBox.critical(self,"Schema Error",msg)
-            worker.signals.finished.connect(on_finish)
-            worker.signals.error.connect(on_error)
-            self.threadpool.start(worker)
-        elif dt=="table" and not loaded:
-            it.takeChildren()
-            dbN=it.parent().text(0)
-            tblN=it.text(0)
-            cols=load_columns_for_table(self.conn, dbN,tblN)
-            if cols:
-                for cc in cols:
-                    c_item=QTreeWidgetItem([cc])
-                    c_item.setData(0,Qt.UserRole,"column")
-                    it.addChild(c_item)
-            else:
-                it.addChild(QTreeWidgetItem(["<No columns>"]))
-            it.setData(0,Qt.UserRole+1,True)
-
-    def populate_db_node(self, db_item, tables):
+    def populate_tables(self, parent_item, dbname, tables):
         if not tables:
-            db_item.addChild(QTreeWidgetItem(["<No tables>"]))
-            db_item.setData(0,Qt.UserRole+1,True)
+            parent_item.addChild(QTreeWidgetItem(["<No Tables>"]))
+            parent_item.setData(0, Qt.UserRole+1, True)
             return
-        db_item.takeChildren()
+        parent_item.takeChildren()
+        d= parent_item.data(0, Qt.UserRole)
+        alias= d[1]
         for t in tables:
             t_item=QTreeWidgetItem([t])
-            t_item.setData(0,Qt.UserRole,"table")
-            t_item.setData(0,Qt.UserRole+1,False)
+            t_item.setData(0, Qt.UserRole, ("table",alias,dbname,t))
+            t_item.setData(0, Qt.UserRole+1, False)
             t_item.addChild(QTreeWidgetItem(["Loading..."]))
-            db_item.addChild(t_item)
-        db_item.setData(0,Qt.UserRole+1,True)
+            parent_item.addChild(t_item)
+        parent_item.setData(0, Qt.UserRole+1, True)
 
-    def startDrag(self, actions):
-        it=self.currentItem()
-        if it and it.parent() and it.data(0,Qt.UserRole)=="table":
-            dbN=it.parent().text(0)
-            tblN=it.text(0)
-            full=f"{dbN}.{tblN}"
-            drag=QtGui.QDrag(self)
-            mime=QtCore.QMimeData()
-            mime.setText(full)
-            drag.setMimeData(mime)
-            drag.exec_(actions)
+    def expand_table(self, table_item):
+        loaded= table_item.data(0, Qt.UserRole+1)
+        if not loaded:
+            table_item.takeChildren()
+            d= table_item.data(0, Qt.UserRole)
+            alias, dbn, tbn= d[1], d[2], d[3]
+            info= self.connections.get(alias)
+            if info:
+                c=info["connection"]
+                dbt= info["db_type"]
+                cols= load_columns(c,dbt,dbn,tbn)
+                if cols:
+                    for cc in cols:
+                        child=QTreeWidgetItem([cc])
+                        child.setData(0, Qt.UserRole, ("column",alias,dbn,tbn,cc))
+                        table_item.addChild(child)
+                else:
+                    table_item.addChild(QTreeWidgetItem(["<No columns>"]))
+            table_item.setData(0, Qt.UserRole+1, True)
+
+    def mousePressEvent(self,e):
+        it=self.itemAt(e.pos())
+        if it:
+            d= it.data(0, Qt.UserRole)
+            if d and d[0]=="table":
+                self.expand_table(it)
+        super().mousePressEvent(e)
+
+    def startDrag(self,actions):
+        it= self.currentItem()
+        if it:
+            d= it.data(0, Qt.UserRole)
+            if d and d[0]=="table":
+                alias,dbn,tbl= d[1], d[2], d[3]
+                full_key= f"{alias}.{dbn}.{tbl}"
+                drag= QtGui.QDrag(self)
+                mime= QtCore.QMimeData()
+                mime.setText(full_key)
+                drag.setMimeData(mime)
+                drag.exec_(actions)
 
 ###############################################################################
-# 5) FullSQLParser & SyntaxHighlighter
+# Basic SQL Parser + Syntax Highlighter
 ###############################################################################
 class FullSQLParser:
     def __init__(self, sql):
         self.sql=sql
     def parse(self):
-        st=sqlparse.parse(self.sql)
-        if not st:
+        parsed=sqlparse.parse(self.sql)
+        if not parsed:
             raise ValueError("No valid SQL found.")
 
 class SQLHighlighter(QSyntaxHighlighter):
@@ -349,106 +532,182 @@ class SQLHighlighter(QSyntaxHighlighter):
         kwfmt=QTextCharFormat()
         kwfmt.setForeground(Qt.darkBlue)
         kwfmt.setFontWeight(QFont.Bold)
-
         keywords=[
             "SELECT","FROM","WHERE","JOIN","INNER","LEFT","RIGHT","FULL","OUTER",
             "GROUP","BY","HAVING","ORDER","LIMIT","OFFSET","UNION","ALL","INTERSECT",
             "EXCEPT","AS","ON","AND","OR","NOT","IN","IS","NULL","EXISTS","COUNT",
             "SUM","AVG","MIN","MAX","INSERT","UPDATE","DELETE","VALUES","OVER",
             "PARTITION","ROWS","RANGE","CURRENT ROW","ROW_NUMBER","RANK","DENSE_RANK",
-            "NTILE","LAG","LEAD","CASE","COALESCE","TRIM"
+            "NTILE","LAG","LEAD","CASE","COALESCE","TRIM","FIRST_VALUE","LAST_VALUE",
+            "WITH"
         ]
         for w in keywords:
-            pat=QRegularExpression(r'\b'+w+r'\b', QRegularExpression.CaseInsensitiveOption)
-            self.rules.append((pat,kwfmt))
+            pat= QRegularExpression(r'\b'+w+r'\b', QRegularExpression.CaseInsensitiveOption)
+            self.rules.append((pat, kwfmt))
 
         strfmt=QTextCharFormat()
         strfmt.setForeground(Qt.darkRed)
         self.rules.append((QRegularExpression(r"'[^']*'"),strfmt))
         self.rules.append((QRegularExpression(r'"[^"]*"'),strfmt))
 
-        cfmt=QTextCharFormat()
-        cfmt.setForeground(Qt.green)
-        self.rules.append((QRegularExpression(r'--[^\n]*'),cfmt))
-        self.rules.append((QRegularExpression(r'/\*.*\*/',QRegularExpression.DotMatchesEverythingOption),cfmt))
+        comfmt=QTextCharFormat()
+        comfmt.setForeground(Qt.green)
+        self.rules.append((QRegularExpression(r'--[^\n]*'), comfmt))
+        self.rules.append((QRegularExpression(r'/\*.*\*/',QRegularExpression.DotMatchesEverythingOption), comfmt))
 
-    def highlightBlock(self,text):
+    def highlightBlock(self, text):
         for pat,fmt in self.rules:
-            matches=pat.globalMatch(text)
+            matches= pat.globalMatch(text)
             while matches.hasNext():
-                m=matches.next()
-                st=m.capturedStart()
-                ln=m.capturedLength()
+                m= matches.next()
+                st= m.capturedStart()
+                ln= m.capturedLength()
                 self.setFormat(st,ln,fmt)
         self.setCurrentBlockState(0)
 
 ###############################################################################
-# 6) MappingLine & JoinLine (sticky) with context menus
+# BFS Items (CollapsibleTable, BFS, lines, join wizard, etc.)
 ###############################################################################
+class ColumnJoinWizardDialog(QDialog):
+    def __init__(self, source_full, source_type, target_full, target_type, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Column Join Wizard")
+        self.resize(400,200)
+        self.source_col= source_full
+        self.source_type= source_type
+        self.target_col= target_full
+        self.target_type= target_type
+        self.join_type="INNER"
+        self.condition= f"{self.source_col} = {self.target_col}"
+
+        layout= QVBoxLayout(self)
+        info_label= QLabel(f"Source: {self.source_col} (type={self.source_type})\n"
+                           f"Target: {self.target_col} (type={self.target_type})")
+        layout.addWidget(info_label)
+        if self.source_type.lower() != self.target_type.lower():
+            w= QLabel("<b>Warning:</b> Different data types (may require cast).")
+            w.setStyleSheet("color:red;")
+            layout.addWidget(w)
+
+        form= QFormLayout()
+        self.join_combo= QComboBox()
+        self.join_combo.addItems(["INNER","LEFT","RIGHT","FULL"])
+        form.addRow("Join Type:", self.join_combo)
+
+        self.cond_edit= QLineEdit(self.condition)
+        form.addRow("Condition:", self.cond_edit)
+        layout.addLayout(form)
+
+        btns= QDialogButtonBox(QDialogButtonBox.Ok| QDialogButtonBox.Cancel)
+        layout.addWidget(btns)
+        btns.accepted.connect(self.on_ok)
+        btns.rejected.connect(self.reject)
+        self.setLayout(layout)
+
+    def on_ok(self):
+        jt= self.join_combo.currentText()
+        c= self.cond_edit.text().strip()
+        if not c:
+            QMessageBox.warning(self,"No condition","Condition is empty.")
+            return
+        self.join_type= jt
+        self.condition= c
+        self.accept()
+
+    def get_join_data(self):
+        return (self.join_type, self.condition)
+
+
 class MappingLine(QGraphicsLineItem):
-    def __init__(self, source_text_item, target_text_item, src_type=None, tgt_type=None):
+    """
+    For DML mappings (source col => target col).
+    """
+    def __init__(self, source_text_item, target_text_item, canvas, src_type=None, tgt_type=None):
         super().__init__()
-        self.source_text_item=source_text_item
-        self.target_text_item=target_text_item
-        self.source_col=source_text_item.toPlainText()
-        self.target_col=target_text_item.toPlainText()
-        self.source_type=src_type
-        self.target_type=tgt_type
+        self.canvas= canvas
+        self.source_text_item= source_text_item
+        self.target_text_item= target_text_item
+        self.source_col= source_text_item.toPlainText()
+        self.target_col= target_text_item.toPlainText()
+        self.src_type= src_type
+        self.tgt_type= tgt_type
+
         self.setPen(QPen(Qt.darkRed,2,Qt.SolidLine))
         self.setZValue(5)
+        self.setFlags(QGraphicsItem.ItemIsSelectable|QGraphicsItem.ItemIsFocusable)
         self.setAcceptHoverEvents(True)
         self.update_pos()
 
     def update_pos(self):
-        s=self.source_text_item.mapToScene(self.source_text_item.boundingRect().center())
-        t=self.target_text_item.mapToScene(self.target_text_item.boundingRect().center())
+        s= self.source_text_item.mapToScene(self.source_text_item.boundingRect().center())
+        t= self.target_text_item.mapToScene(self.target_text_item.boundingRect().center())
         self.setLine(QtCore.QLineF(s,t))
 
-    def paint(self,painter,option,widget):
+    def paint(self, painter, option, widget):
         self.update_pos()
-        super().paint(painter,option,widget)
+        super().paint(painter, option, widget)
 
     def contextMenuEvent(self,event):
-        menu=QMenu()
-        rm=menu.addAction("Remove Mapping")
-        chosen=menu.exec_(event.screenPos())
-        if chosen==rm:
-            sc=self.scene()
+        menu= QMenu()
+        rm= menu.addAction("Remove Column Mapping")
+        chosen= menu.exec_(event.screenPos())
+        if chosen== rm:
+            if self in self.canvas.mapping_lines:
+                self.canvas.mapping_lines.remove(self)
+            sc= self.scene()
             if sc:
                 sc.removeItem(self)
 
+
 class JoinLine(QGraphicsLineItem):
-    def __init__(self, start_item, end_item, join_type="INNER", condition=""):
+    """
+    BFS join line => table => table
+    """
+    def __init__(self, start_item, end_item, jtype="INNER", condition="", start_col_item=None, end_col_item=None):
         super().__init__()
-        self.start_item=start_item
-        self.end_item=end_item
-        self.join_type=join_type
-        self.condition=condition
+        self.start_item= start_item
+        self.end_item= end_item
+        self.join_type= jtype
+        self.condition= condition
+        self.start_col_item= start_col_item
+        self.end_col_item= end_col_item
         self.setZValue(-1)
         self.setAcceptHoverEvents(True)
 
-        self.pen_map={
-            "INNER":(Qt.darkBlue,Qt.SolidLine),
-            "LEFT":(Qt.darkGreen,Qt.SolidLine),
-            "RIGHT":(Qt.magenta,Qt.DotLine),
-            "FULL":(Qt.red,Qt.DashLine)
+        self.pen_map= {
+            "INNER": (Qt.darkBlue, Qt.SolidLine),
+            "LEFT":  (Qt.darkGreen, Qt.SolidLine),
+            "RIGHT": (Qt.magenta,  Qt.DotLine),
+            "FULL":  (Qt.red,      Qt.DashLine),
         }
-        self.label=QGraphicsTextItem(self.join_type,self)
+        self.label= QGraphicsTextItem(f"{self.join_type} JOIN", self)
         self.label.setDefaultTextColor(Qt.blue)
         self.update_line()
 
     def update_line(self):
-        s=self.start_item.scenePos()+QPointF(100,30)
-        e=self.end_item.scenePos()+QPointF(100,30)
-        self.setLine(QtCore.QLineF(s,e))
-        mx=(s.x()+e.x())/2
-        my=(s.y()+e.y())/2
+        if self.start_col_item:
+            sr= self.start_col_item.boundingRect()
+            scn= self.start_col_item.mapToScene(sr.center())
+        else:
+            sr= self.start_item.boundingRect()
+            scn= self.start_item.mapToScene(sr.center())
+
+        if self.end_col_item:
+            er= self.end_col_item.boundingRect()
+            ecn= self.end_col_item.mapToScene(er.center())
+        else:
+            er= self.end_item.boundingRect()
+            ecn= self.end_item.mapToScene(er.center())
+
+        self.setLine(QtCore.QLineF(scn, ecn))
+        mx= (scn.x()+ ecn.x())/2
+        my= (scn.y()+ ecn.y())/2
         self.label.setPos(mx,my)
-        c,style=self.pen_map.get(self.join_type,(Qt.gray,Qt.SolidLine))
-        self.setPen(QPen(c,2,style))
+        color, style= self.pen_map.get(self.join_type,(Qt.gray, Qt.SolidLine))
+        self.setPen(QPen(color,2,style))
 
     def hoverEnterEvent(self,e):
-        p=self.pen()
+        p= self.pen()
         p.setColor(Qt.yellow)
         p.setWidth(3)
         self.setPen(p)
@@ -458,1020 +717,266 @@ class JoinLine(QGraphicsLineItem):
         self.update_line()
         super().hoverLeaveEvent(e)
 
-    def contextMenuEvent(self, event):
-        menu=QMenu()
-        rm=menu.addAction("Remove Join")
-        chosen=menu.exec_(event.screenPos())
-        if chosen==rm:
-            sc=self.scene()
-            if sc:
-                sc.removeItem(self)
 
-###############################################################################
-# 7) ManualJoinDialog, CollapsibleTableGraphicsItem
-###############################################################################
-class ManualJoinDialog(QDialog):
-    def __init__(self, current_table_key, other_table_keys, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Manual Join")
-        self.resize(400,200)
-        self.current_table_key=current_table_key
-        self.other_table_keys=other_table_keys
-        self.selected_join_type="INNER"
-        self.selected_other=""
-        self.join_condition=""
+class DraggableColumnTextItem(QGraphicsTextItem):
+    def __init__(self, parent_table_item, col_name, col_type):
+        super().__init__(col_name, parent_table_item)
+        self.parent_table_item= parent_table_item
+        self.col_name= col_name
+        self.col_type= col_type
+        self.setFlags(QGraphicsItem.ItemIsSelectable| QGraphicsItem.ItemIsFocusable)
+        self.setAcceptDrops(True)
 
-        lay=QVBoxLayout(self)
-        form=QFormLayout()
+    def mousePressEvent(self, e):
+        if e.button()== Qt.LeftButton:
+            drag= QtGui.QDrag(e.widget())
+            mime= QtCore.QMimeData()
+            full_col= f"{self.parent_table_item.table_fullname}.{self.col_name}"
+            mime.setText(f"{full_col}||{self.col_type}")
+            drag.setMimeData(mime)
+            drag.exec_(Qt.MoveAction)
+        else:
+            super().mousePressEvent(e)
 
-        self.join_cb=QComboBox()
-        self.join_cb.addItems(["INNER","LEFT","RIGHT","FULL"])
-        form.addRow("Join Type:",self.join_cb)
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasText() and "||" in e.mimeData().text():
+            e.acceptProposedAction()
+        else:
+            e.ignore()
 
-        self.other_cb=QComboBox()
-        self.other_cb.addItems(other_table_keys)
-        form.addRow("Other Table:",self.other_cb)
+    def dragMoveEvent(self, e):
+        e.acceptProposedAction()
 
-        self.cond_ed=QLineEdit(f"{current_table_key}.id = ???")
-        form.addRow("Condition:",self.cond_ed)
-
-        lay.addLayout(form)
-        btns=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
-        lay.addWidget(btns)
-        btns.accepted.connect(self.on_ok)
-        btns.rejected.connect(self.reject)
-        self.setLayout(lay)
-
-    def on_ok(self):
-        self.selected_join_type=self.join_cb.currentText()
-        self.selected_other=self.other_cb.currentText()
-        self.join_condition=self.cond_ed.text().strip()
-        if not self.join_condition:
-            QMessageBox.warning(self,"No Condition","Join condition is empty.")
+    def dropEvent(self,e):
+        txt= e.mimeData().text()
+        if "||" not in txt:
+            e.ignore()
             return
-        self.accept()
+        source_full, source_type= txt.split("||",1)
+        target_full= f"{self.parent_table_item.table_fullname}.{self.col_name}"
+        target_type= self.col_type
 
-    def get_result(self):
-        return (self.selected_join_type,self.selected_other,self.join_condition)
+        if source_full == target_full:
+            QMessageBox.information(None,"Same Column","Cannot join a column to itself.")
+            e.ignore()
+            return
+
+        # If the BFS item for both is the same, it's the same table => not valid for BFS multi-join
+        # but might be valid for a self-join in advanced scenarios. We'll disallow by default:
+        sf_tab= ".".join(source_full.split(".")[:3])
+        tf_tab= ".".join(target_full.split(".")[:3])
+        if sf_tab == tf_tab:
+            # For DML? If this BFS item is the target item, we might do a mapping. We'll see below.
+            pass
+
+        # We'll figure out if this is a BFS table-to-table join or a DML mapping (source => target).
+        builder= self.parent_table_item.parent_builder
+        canvas= builder.canvas
+
+        # Check if either BFS item is "marked as DML target":
+        is_source_target= self.parent_table_item.is_dml_target
+        # We'll also look up the BFS item on the other side:
+        source_item= canvas.table_items.get(sf_tab)
+        target_item= canvas.table_items.get(tf_tab)
+
+        if (not source_item) or (not target_item):
+            QMessageBox.warning(None,"Join Error","Could not find BFS items for source/target.")
+            e.ignore()
+            return
+
+        # If one BFS item is DML target, we do a "mapping line."
+        # Otherwise, we do a "join line."
+        if source_item.is_dml_target and (not target_item.is_dml_target):
+            # So the user dragged from a "non-target" onto the "target" BFS item
+            # => DML mapping line
+            self.create_mapping_line(source_full, source_type, target_full, target_type, source_item, target_item, e)
+        elif target_item.is_dml_target and (not source_item.is_dml_target):
+            # The user dragged from "non-target" BFS item onto a "target" BFS item
+            self.create_mapping_line(source_full, source_type, target_full, target_type, source_item, target_item, e)
+        else:
+            # We'll do a BFS join line wizard
+            self.create_join_line(source_full, source_type, target_full, target_type, source_item, target_item, e)
+
+    def create_join_line(self, source_full, source_type, target_full, target_type, source_item, target_item, drop_event):
+        dlg= ColumnJoinWizardDialog(source_full, source_type, target_full, target_type)
+        if dlg.exec_()== QDialog.Accepted:
+            jtype, cond= dlg.get_join_data()
+            s_col_name= source_full.split(".")[-1]
+            t_col_name= target_full.split(".")[-1]
+            src_col_item= source_item.column_text_items.get(s_col_name)
+            tgt_col_item= target_item.column_text_items.get(t_col_name)
+
+            jl= JoinLine(source_item, target_item, jtype, cond, src_col_item, tgt_col_item)
+            self.parent_table_item.parent_builder.canvas.scene_.addItem(jl)
+            self.parent_table_item.parent_builder.canvas.join_lines.append(jl)
+            jl.update_line()
+            QMessageBox.information(None,"Join Created",f"{jtype} JOIN:\n{cond}")
+            drop_event.acceptProposedAction()
+        else:
+            drop_event.ignore()
+
+    def create_mapping_line(self, source_full, source_type, target_full, target_type, source_item, target_item, drop_event):
+        # DML mapping line
+        # We'll skip a wizard and just create the mapping line.
+        s_col_name= source_full.split(".")[-1]
+        t_col_name= target_full.split(".")[-1]
+
+        src_txt= source_item.column_text_items.get(s_col_name)
+        tgt_txt= target_item.column_text_items.get(t_col_name)
+
+        ml= MappingLine(src_txt, tgt_txt, self.parent_table_item.parent_builder.canvas, source_type, target_type)
+        self.parent_table_item.parent_builder.canvas.scene_.addItem(ml)
+        self.parent_table_item.parent_builder.canvas.mapping_lines.append(ml)
+        drop_event.acceptProposedAction()
+
 
 class CollapsibleTableGraphicsItem(QGraphicsRectItem):
-    def __init__(self, table_fullname, columns, parent_builder, x=0,y=0):
+    """
+    BFS item => real DB table => user can check columns for SELECT usage
+    Also can mark as "is_dml_target" => used for DML mapping lines
+    """
+    def __init__(self, table_fullname, columns, parent_builder, x=0, y=0):
         super().__init__(0,0,220,40)
         self.setPos(x,y)
         self.setBrush(QBrush(QColor(220,220,255)))
         self.setPen(QPen(Qt.darkGray,2))
         self.setFlags(QGraphicsItem.ItemIsMovable|QGraphicsItem.ItemIsSelectable)
+        self.table_fullname= table_fullname
+        self.columns= columns
+        self.parent_builder= parent_builder
+        self.is_collapsed= True
+        self.is_dml_target= False
+        self.title_height= 20
+        self.column_items=[]
+        self.column_text_items={}
 
-        self.table_fullname=table_fullname
-        self.columns=columns
-        self.parent_builder=parent_builder
-        self.is_collapsed=True
-        self.title_height=20
-        self.column_items=[]  # [rect, text, isChecked]
-
-        self.close_btn=QGraphicsTextItem("[X]",self)
+        # Close + toggle
+        self.close_btn= QGraphicsTextItem("[X]", self)
         self.close_btn.setPos(190,2)
         self.close_btn.setDefaultTextColor(Qt.red)
 
-        self.toggle_btn=QGraphicsTextItem("[+]",self)
-        self.toggle_btn.setPos(165,2)
+        self.toggle_btn= QGraphicsTextItem("[+]", self)
+        self.toggle_btn.setPos(170,2)
         self.toggle_btn.setDefaultTextColor(Qt.blue)
 
-        f=QFont("Arial",9,QFont.Bold)
-        self.title_text=QGraphicsTextItem(table_fullname,self)
+        f= QFont("Arial",9,QFont.Bold)
+        self.title_text= QGraphicsTextItem(table_fullname, self)
         self.title_text.setFont(f)
         self.title_text.setPos(5,2)
 
-        yOff=self.title_height
-        for ccc in columns:
-            r=QGraphicsRectItem(5,yOff+4,10,10,self)
-            r.setBrush(QBrush(Qt.white))
-            r.setPen(QPen(Qt.black,1))
-            t=QGraphicsTextItem(ccc,self)
-            t.setPos(20,yOff)
-            self.column_items.append([r,t,False])
-            yOff+=20
+        # We'll guess column types
+        self.mock_types={}
+        for c in columns:
+            if c.lower().startswith("id") or c.lower().endswith("id"):
+                self.mock_types[c] = "INT"
+            else:
+                self.mock_types[c] = "VARCHAR"
+
+        yOff= self.title_height
+        for c in columns:
+            cRect= QGraphicsRectItem(5,yOff+4,10,10,self)
+            cRect.setBrush(QBrush(Qt.white))
+            cRect.setPen(QPen(Qt.black,1))
+            cTxt= DraggableColumnTextItem(self, c, self.mock_types[c])
+            cTxt.setPos(20,yOff)
+            self.column_items.append([cRect, cTxt, False])
+            self.column_text_items[c]= cTxt
+            yOff+= 20
 
         self.update_layout()
 
     def update_layout(self):
         if self.is_collapsed:
             self.setRect(0,0,220,self.title_height)
-            for (cb,ct,chk) in self.column_items:
-                cb.setVisible(False)
-                ct.setVisible(False)
+            for (r,t,_) in self.column_items:
+                r.setVisible(False)
+                t.setVisible(False)
             self.toggle_btn.setPlainText("[+]")
         else:
-            expanded=self.title_height+len(self.column_items)*20
+            expanded = self.title_height + len(self.column_items)*20
             self.setRect(0,0,220,expanded)
-            for (cb,ct,chk) in self.column_items:
-                cb.setVisible(True)
-                ct.setVisible(True)
+            for (r,t,_) in self.column_items:
+                r.setVisible(True)
+                t.setVisible(True)
             self.toggle_btn.setPlainText("[-]")
+        # reposition the close & toggle
+        self.close_btn.setPos(190,2)
+        self.toggle_btn.setPos(170,2)
 
-    def mousePressEvent(self,event):
-        pos=event.pos()
-        cbr=self.close_btn.mapToParent(self.close_btn.boundingRect())
-        if cbr.boundingRect().contains(pos):
-            sc=self.scene()
-            if sc:
-                self.parent_builder.handle_remove_table(self)
-                sc.removeItem(self)
-            event.accept()
+        # If is_dml_target => highlight
+        if self.is_dml_target:
+            self.setBrush(QBrush(QColor(255,240,200)))
+        else:
+            self.setBrush(QBrush(QColor(220,220,255)))
+
+    def mousePressEvent(self, ev):
+        pos= ev.pos()
+        cR= self.close_btn.mapToParent(self.close_btn.boundingRect()).boundingRect()
+        if cR.contains(pos):
+            # remove BFS item
+            self.parent_builder.handle_remove_table(self)
+            ev.accept()
             return
-
-        tbr=self.toggle_btn.mapToParent(self.toggle_btn.boundingRect())
-        if tbr.boundingRect().contains(pos):
-            self.is_collapsed=not self.is_collapsed
+        tR= self.toggle_btn.mapToParent(self.toggle_btn.boundingRect()).boundingRect()
+        if tR.contains(pos):
+            self.is_collapsed= not self.is_collapsed
             self.update_layout()
-            event.accept()
+            ev.accept()
             return
 
-        for i,(cb,ct,chk) in enumerate(self.column_items):
-            rr=cb.mapToParent(cb.boundingRect()).boundingRect()
+        # check for column "checkbox"
+        for i,(rc,tc,checked) in enumerate(self.column_items):
+            rr= rc.mapToParent(rc.boundingRect()).boundingRect()
             if rr.contains(pos):
-                self.column_items[i][2]=not chk
-                if self.column_items[i][2]:
-                    cb.setBrush(QBrush(Qt.blue))
-                else:
-                    cb.setBrush(QBrush(Qt.white))
+                self.column_items[i][2]= not checked
+                rc.setBrush(QBrush(Qt.blue if self.column_items[i][2] else Qt.white))
                 if self.parent_builder.auto_generate:
                     self.parent_builder.generate_sql()
-                event.accept()
+                ev.accept()
                 return
-        super().mousePressEvent(event)
+        super().mousePressEvent(ev)
 
-    def contextMenuEvent(self,event):
-        menu=QMenu()
-        rm_act=menu.addAction("Remove Table")
-        join_act=menu.addAction("Add Manual Join")
-        chosen=menu.exec_(event.screenPos())
-        if chosen==rm_act:
-            sc=self.scene()
-            if sc:
-                self.parent_builder.handle_remove_table(self)
-                sc.removeItem(self)
-        elif chosen==join_act:
-            tabmap=self.parent_builder.canvas.table_items
-            mykey=None
-            for k,v in tabmap.items():
-                if v==self:
-                    mykey=k
-                    break
-            if not mykey:
-                return
-            other_keys=[x for x in tabmap.keys() if x!=mykey and not x.startswith("SubQueryItem_")]
-            if not other_keys:
-                QMessageBox.information(None,"No Other Tables","No other tables on canvas to join with.")
-                return
-            dlg=ManualJoinDialog(mykey,other_keys)
-            if dlg.exec_()==QDialog.Accepted:
-                jt,oth,cond=dlg.get_result()
-                if oth in tabmap:
-                    other_item=tabmap[oth]
-                    jl=JoinLine(self,other_item,jt,cond)
-                    self.scene().addItem(jl)
-                    self.parent_builder.canvas.join_lines.append(jl)
-                    jl.update_line()
-                else:
-                    QMessageBox.warning(None,"Not found",f"Can't find {oth} on canvas.")
+    def contextMenuEvent(self, ev):
+        menu= QMenu()
+        mark_tgt= menu.addAction("Mark as DML Target" if not self.is_dml_target else "Unmark as DML Target")
+        rm= menu.addAction("Remove Table/CTE")
+        chosen= menu.exec_(ev.screenPos())
+        if chosen== mark_tgt:
+            self.is_dml_target= not self.is_dml_target
+            self.update_layout()
+            if self.parent_builder.auto_generate:
+                self.parent_builder.generate_sql()
+        elif chosen== rm:
+            self.parent_builder.handle_remove_table(self)
 
     def get_selected_columns(self):
         arr=[]
-        for (cb,ct,chk) in self.column_items:
-            if chk:
-                colName=ct.toPlainText().strip()
-                arr.append(f"{self.table_fullname}.{colName}")
+        for (r,t,ck) in self.column_items:
+            if ck:
+                arr.append(f"{self.table_fullname}.{t.col_name}")
         return arr
 
-    def itemChange(self, change, value):
-        if change==QGraphicsItem.ItemPositionHasChanged:
-            sc=self.scene()
-            if sc and hasattr(sc,"update_lines_for_item"):
-                sc.update_lines_for_item(self)
-        return super().itemChange(change,value)
-
 ###############################################################################
-# 8) SubVQBDialog, NestedSubqueryItem
-###############################################################################
-class SubVQBDialog(QDialog):
-    def __init__(self, parent_vqb=None, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Build Second Query (Full VQB)")
-        self.resize(900,600)
-        self.operator="UNION"
-        self.second_sql=""
-        self.parent_vqb=parent_vqb
-
-        lay=QVBoxLayout(self)
-
-        op_h=QHBoxLayout()
-        op_h.addWidget(QLabel("Combine Operator:"))
-        self.op_combo=QComboBox()
-        self.op_combo.addItems(["UNION","UNION ALL","INTERSECT","EXCEPT"])
-        op_h.addWidget(self.op_combo)
-        op_h.addStretch()
-        lay.addLayout(op_h)
-
-        from_vqb=VisualQueryBuilderTab()
-        self.sub_vqb=from_vqb
-        lay.addWidget(from_vqb)
-
-        btns=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
-        lay.addWidget(btns)
-        btns.accepted.connect(self.on_ok)
-        btns.rejected.connect(self.reject)
-
-        self.setLayout(lay)
-
-        if parent_vqb and hasattr(parent_vqb,"connections"):
-            self.sub_vqb.set_connections(parent_vqb.connections)
-
-    def on_ok(self):
-        self.operator=self.op_combo.currentText()
-        self.second_sql=self.sub_vqb.sql_display.toPlainText().strip()
-        if not self.second_sql:
-            QMessageBox.warning(self,"No SQL","Second query is empty.")
-            return
-        self.accept()
-
-    def getResult(self):
-        return (self.operator,self.second_sql)
-
-class NestedVQBDialog(QDialog):
-    def __init__(self, existing_sql="", parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Nested SubVQB")
-        self.resize(900,600)
-        self.existing_sql=existing_sql
-        main=QVBoxLayout(self)
-
-        self.sub_vqb=VisualQueryBuilderTab()
-        main.addWidget(self.sub_vqb)
-
-        btns=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
-        main.addWidget(btns)
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-        self.setLayout(main)
-
-    def set_connections(self, conns):
-        if self.sub_vqb:
-            self.sub_vqb.set_connections(conns)
-
-    def get_built_sql(self):
-        if self.sub_vqb:
-            return self.sub_vqb.sql_display.toPlainText().strip()
-        return ""
-
-class NestedSubqueryItem(QGraphicsRectItem):
-    def __init__(self, parent_builder=None, x=0, y=0):
-        super().__init__(0,0,220,80)
-        self.setPos(x,y)
-        self.setBrush(QBrush(QColor(200,255,200)))
-        self.setPen(QPen(Qt.darkGreen,2))
-        self.setFlags(QGraphicsItem.ItemIsMovable|QGraphicsItem.ItemIsSelectable)
-
-        self.query_text="-- Subquery"
-        self.label=QGraphicsTextItem("Nested SubQuery\n(double-click)", self)
-        self.label.setPos(5,5)
-        f=QFont("Arial",9,QFont.Bold)
-        self.label.setFont(f)
-        self.parent_builder=parent_builder
-
-    def mouseDoubleClickEvent(self,event):
-        dlg=NestedVQBDialog(self.query_text)
-        if self.parent_builder and hasattr(self.parent_builder,"connections"):
-            dlg.set_connections(self.parent_builder.connections)
-        if dlg.exec_()==QDialog.Accepted:
-            new_sql=dlg.get_built_sql()
-            if new_sql:
-                self.query_text=new_sql
-                self.label.setPlainText("Nested SubQuery\n(VQB built)")
-        event.accept()
-
-    def contextMenuEvent(self,event):
-        menu=QMenu()
-        rmAct=menu.addAction("Remove SubQuery")
-        chosen=menu.exec_(event.screenPos())
-        if chosen==rmAct:
-            sc=self.scene()
-            if sc:
-                sc.removeItem(self)
-
-    def get_sql(self):
-        return self.query_text
-
-    def itemChange(self, change, value):
-        if change==QGraphicsItem.ItemPositionHasChanged:
-            sc=self.scene()
-            if sc and hasattr(sc,"update_lines_for_item"):
-                sc.update_lines_for_item(self)
-        return super().itemChange(change,value)
-
-###############################################################################
-# 9) Expression Builder
-###############################################################################
-class CaseWizardDialog(QDialog):
-    def __init__(self, available_columns, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("CASE Wizard")
-        self.available_columns=available_columns
-        self.conditions=[]
-        self.else_result=""
-
-        main=QVBoxLayout(self)
-        top_h=QHBoxLayout()
-        add_btn=QPushButton("Add Condition")
-        add_btn.clicked.connect(self.add_condition)
-        rm_btn=QPushButton("Remove Condition")
-        rm_btn.clicked.connect(self.remove_condition)
-        top_h.addWidget(add_btn)
-        top_h.addWidget(rm_btn)
-        main.addLayout(top_h)
-
-        self.table=QTableWidget(0,4)
-        self.table.setHorizontalHeaderLabels(["Column","Operator","Value","Result"])
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        main.addWidget(self.table)
-
-        else_h=QHBoxLayout()
-        else_h.addWidget(QLabel("ELSE result:"))
-        self.else_edit=QLineEdit()
-        else_h.addWidget(self.else_edit)
-        main.addLayout(else_h)
-
-        btns=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
-        main.addWidget(btns)
-        btns.accepted.connect(self.on_ok)
-        btns.rejected.connect(self.reject)
-        self.setLayout(main)
-
-    def add_condition(self):
-        d=QDialog(self)
-        d.setWindowTitle("Add CASE WHEN")
-        fl=QFormLayout(d)
-        col_cb=QComboBox()
-        col_cb.addItems(self.available_columns)
-        op_cb=QComboBox()
-        op_cb.addItems(["=","<>","<",">","<=",">=","LIKE"])
-        val_ed=QLineEdit("'ABC'")
-        res_ed=QLineEdit("'ValIfTrue'")
-        fl.addRow("Column:",col_cb)
-        fl.addRow("Operator:",op_cb)
-        fl.addRow("Value:",val_ed)
-        fl.addRow("Result:",res_ed)
-        btns=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
-        fl.addWidget(btns)
-        def on_ok():
-            if not col_cb.currentText():
-                QMessageBox.warning(d,"No col","Pick a column.")
-                return
-            d.accept()
-        btns.accepted.connect(on_ok)
-        btns.rejected.connect(d.reject)
-        d.setLayout(fl)
-        if d.exec_()==QDialog.Accepted:
-            c=col_cb.currentText()
-            o=op_cb.currentText()
-            v=val_ed.text().strip()
-            r=res_ed.text().strip()
-            rr=self.table.rowCount()
-            self.table.insertRow(rr)
-            self.table.setItem(rr,0,QTableWidgetItem(c))
-            self.table.setItem(rr,1,QTableWidgetItem(o))
-            self.table.setItem(rr,2,QTableWidgetItem(v))
-            self.table.setItem(rr,3,QTableWidgetItem(r))
-
-    def remove_condition(self):
-        rows=sorted([x.row() for x in self.table.selectionModel().selectedRows()],reverse=True)
-        for rr in rows:
-            self.table.removeRow(rr)
-
-    def on_ok(self):
-        self.else_result=self.else_edit.text().strip()
-        self.accept()
-
-    def build_expression(self):
-        lines=["CASE"]
-        for r in range(self.table.rowCount()):
-            c=self.table.item(r,0).text()
-            o=self.table.item(r,1).text()
-            v=self.table.item(r,2).text()
-            re=self.table.item(r,3).text()
-            lines.append(f"  WHEN {c}{o}{v} THEN {re}")
-        if self.else_result:
-            lines.append(f"  ELSE {self.else_result}")
-        lines.append("END")
-        return "\n".join(lines)
-
-class AdvancedExpressionBuilderDialog(QDialog):
-    def __init__(self, available_columns, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Advanced Expression Builder")
-        self.available_cols=available_columns
-        self.expr_text=""
-        self.alias="ExprAlias"
-
-        main=QVBoxLayout(self)
-
-        snippet_h=QHBoxLayout()
-        snippet_h.addWidget(QLabel("Snippets:"))
-        self.snippet_cb=QComboBox()
-        self.snippet_cb.addItems(["(Pick Snippet)",
-                                  "DATE_DIFF example",
-                                  "Rolling 90 day",
-                                  "COALESCE sample"])
-        snippet_btn=QPushButton("Insert Snippet")
-        snippet_btn.clicked.connect(self.insert_snippet)
-        snippet_h.addWidget(self.snippet_cb)
-        snippet_h.addWidget(snippet_btn)
-        snippet_h.addStretch()
-        main.addLayout(snippet_h)
-
-        self.expr_edit=QTextEdit()
-        self.expr_edit.setPlaceholderText("Build or type your expression here.")
-        main.addWidget(self.expr_edit)
-
-        row_ops=QHBoxLayout()
-
-        col_cb=QComboBox()
-        col_cb.addItems(["(Pick Col)"]+self.available_cols)
-        col_btn=QPushButton("Insert Col")
-        def add_col():
-            c=col_cb.currentText()
-            if c and c!="(Pick Col)":
-                self.insert_text(c+" ")
-        col_btn.clicked.connect(add_col)
-        row_ops.addWidget(col_cb)
-        row_ops.addWidget(col_btn)
-
-        op_cb=QComboBox()
-        op_cb.addItems(["+","-","*","/","=","<>","<",">","<=",">=","AND","OR","LIKE","BETWEEN"])
-        op_btn=QPushButton("Insert Op")
-        def add_op():
-            o=op_cb.currentText()
-            self.insert_text(o+" ")
-        op_btn.clicked.connect(add_op)
-        row_ops.addWidget(op_cb)
-        row_ops.addWidget(op_btn)
-
-        func_cb=QComboBox()
-        func_cb.addItems(["(Pick Func)",
-                          "UPPER","LOWER","ABS","COALESCE","SUBSTR","TRIM","CURRENT_DATE","CURRENT_TIMESTAMP"])
-        func_btn=QPushButton("Func")
-        def add_func():
-            fn=func_cb.currentText()
-            if fn and fn!="(Pick Func)":
-                self.insert_text(fn+"() ")
-        func_btn.clicked.connect(add_func)
-        row_ops.addWidget(func_cb)
-        row_ops.addWidget(func_btn)
-
-        subq_btn=QPushButton("SubQuery")
-        subq_btn.clicked.connect(self.add_subquery)
-        row_ops.addWidget(subq_btn)
-
-        case_btn=QPushButton("Case Wizard")
-        case_btn.clicked.connect(self.launch_case_wizard)
-        row_ops.addWidget(case_btn)
-
-        main.addLayout(row_ops)
-
-        alias_h=QHBoxLayout()
-        alias_h.addWidget(QLabel("Alias:"))
-        self.alias_ed=QLineEdit("ExprAlias")
-        alias_h.addWidget(self.alias_ed)
-        main.addLayout(alias_h)
-
-        btns=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
-        main.addWidget(btns)
-        btns.accepted.connect(self.on_ok)
-        btns.rejected.connect(self.reject)
-        self.setLayout(main)
-
-    def insert_snippet(self):
-        choice=self.snippet_cb.currentText()
-        snippet_map={
-            "DATE_DIFF example":"DATEDIFF(day, colDate, CURRENT_DATE)",
-            "Rolling 90 day":"CASE WHEN colDate >= CURRENT_DATE - INTERVAL '90' DAY THEN 1 ELSE 0 END",
-            "COALESCE sample":"COALESCE(colA, colB, 'default')"
-        }
-        if choice in snippet_map:
-            snippet=snippet_map[choice]
-            self.insert_text(snippet+" ")
-
-    def insert_text(self, txt):
-        cur=self.expr_edit.textCursor()
-        cur.insertText(txt)
-        self.expr_edit.setTextCursor(cur)
-
-    def add_subquery(self):
-        d=SubVQBDialog()
-        if d.exec_()==QDialog.Accepted:
-            op, ssql=d.getResult()
-            if ssql:
-                self.insert_text(f"({ssql}) ")
-
-    def launch_case_wizard(self):
-        d=CaseWizardDialog(self.available_cols, self)
-        if d.exec_()==QDialog.Accepted:
-            expr=d.build_expression()
-            self.insert_text(expr+" ")
-
-    def on_ok(self):
-        raw=self.expr_edit.toPlainText().strip()
-        if not raw:
-            QMessageBox.warning(self,"No Expression","Expression empty.")
-            return
-        a=self.alias_ed.text().strip()
-        if not a:
-            QMessageBox.warning(self,"No Alias","Alias needed.")
-            return
-        self.expr_text=raw
-        self.alias=a
-        self.accept()
-
-    def get_expression_data(self):
-        return (self.alias,self.expr_text)
-
-###############################################################################
-# 10) FilterPanel, GroupByPanel + pivot, SortLimitPanel
-###############################################################################
-class FilterPanel(QGroupBox):
-    def __init__(self,builder,parent=None):
-        super().__init__("Filters",parent)
-        self.builder=builder
-        layout=QVBoxLayout(self)
-        self.setLayout(layout)
-        self.tabs=QTabWidget()
-        layout.addWidget(self.tabs)
-
-        self.where_tab=QWidget()
-        self.having_tab=QWidget()
-        self.tabs.addTab(self.where_tab,"WHERE")
-        self.tabs.addTab(self.having_tab,"HAVING")
-
-        # WHERE
-        self.where_layout=QVBoxLayout(self.where_tab)
-        self.where_table=QTableWidget(0,3)
-        self.where_table.setHorizontalHeaderLabels(["Column","Operator","Value"])
-        self.where_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.where_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.where_layout.addWidget(self.where_table)
-
-        wh_btn=QHBoxLayout()
-        addW=QPushButton("Add WHERE")
-        addW.clicked.connect(lambda: self.add_filter("WHERE"))
-        rmW=QPushButton("Remove WHERE")
-        rmW.clicked.connect(lambda: self.remove_filter("WHERE"))
-        wh_btn.addWidget(addW)
-        wh_btn.addWidget(rmW)
-        self.where_layout.addLayout(wh_btn)
-
-        # HAVING
-        self.having_layout=QVBoxLayout(self.having_tab)
-        self.having_table=QTableWidget(0,3)
-        self.having_table.setHorizontalHeaderLabels(["Column","Operator","Value"])
-        self.having_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.having_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.having_layout.addWidget(self.having_table)
-
-        hv_btn=QHBoxLayout()
-        addH=QPushButton("Add HAVING")
-        addH.clicked.connect(lambda: self.add_filter("HAVING"))
-        rmH=QPushButton("Remove HAVING")
-        rmH.clicked.connect(lambda: self.remove_filter("HAVING"))
-        hv_btn.addWidget(addH)
-        hv_btn.addWidget(rmH)
-        self.having_layout.addLayout(hv_btn)
-
-    def add_filter(self, which):
-        cols=self.builder.get_all_possible_columns_for_dialog()
-        if not cols:
-            QMessageBox.warning(self,"No Columns","No columns available.")
-            return
-        d=QDialog(self)
-        d.setWindowTitle(f"Add {which}")
-        fl=QFormLayout(d)
-        col_cb=QComboBox()
-        col_cb.addItems(cols)
-        op_cb=QComboBox()
-        op_cb.addItems(["=","<>","<",">","<=",">=","IS NULL","IS NOT NULL","LIKE"])
-        val_ed=QLineEdit("'ABC'")
-        fl.addRow("Column:",col_cb)
-        fl.addRow("Operator:",op_cb)
-        fl.addRow("Value:",val_ed)
-        btns=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
-        fl.addWidget(btns)
-        def on_ok():
-            if not col_cb.currentText():
-                QMessageBox.warning(d,"No col","Pick a column.")
-                return
-            d.accept()
-        btns.accepted.connect(on_ok)
-        btns.rejected.connect(d.reject)
-        d.setLayout(fl)
-        if d.exec_()==QDialog.Accepted:
-            c=col_cb.currentText()
-            o=op_cb.currentText()
-            v=val_ed.text().strip()
-            table=self.where_table if which=="WHERE" else self.having_table
-            r=table.rowCount()
-            table.insertRow(r)
-            table.setItem(r,0,QTableWidgetItem(c))
-            table.setItem(r,1,QTableWidgetItem(o))
-            table.setItem(r,2,QTableWidgetItem(v))
-            if self.builder.auto_generate:
-                self.builder.generate_sql()
-
-    def remove_filter(self, which):
-        table=self.where_table if which=="WHERE" else self.having_table
-        rows=sorted([x.row() for x in table.selectionModel().selectedRows()],reverse=True)
-        for rr in rows:
-            table.removeRow(rr)
-        if self.builder.auto_generate:
-            self.builder.generate_sql()
-
-    def get_filters(self, which):
-        table=self.where_table if which=="WHERE" else self.having_table
-        res=[]
-        for r in range(table.rowCount()):
-            col=table.item(r,0).text()
-            op=table.item(r,1).text()
-            val=table.item(r,2).text()
-            res.append((col,op,val))
-        return res
-
-class PivotDialog(QDialog):
-    def __init__(self, available_cols, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Pivot Wizard")
-        self.category_col=""
-        self.value_col=""
-        self.distinct_vals=[]
-        layout=QVBoxLayout(self)
-
-        form=QFormLayout()
-        self.cat_cb=QComboBox()
-        self.cat_cb.addItems(available_cols)
-        form.addRow("Category Column:", self.cat_cb)
-
-        self.val_cb=QComboBox()
-        self.val_cb.addItems(available_cols)
-        form.addRow("Value Column:", self.val_cb)
-
-        layout.addLayout(form)
-        self.val_list=QListWidget()
-        self.val_list.setSelectionMode(QAbstractItemView.MultiSelection)
-        layout.addWidget(QLabel("Pick categories (demo)"))
-        layout.addWidget(self.val_list)
-
-        load_btn=QPushButton("Load Distinct (Demo)")
-        load_btn.clicked.connect(self.on_load_demo)
-        layout.addWidget(load_btn)
-
-        btns=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
-        layout.addWidget(btns)
-        btns.accepted.connect(self.on_ok)
-        btns.rejected.connect(self.reject)
-        self.setLayout(layout)
-
-    def on_load_demo(self):
-        self.val_list.clear()
-        for v in ["Manager","Clerk","Sales","IT","HR"]:
-            self.val_list.addItem(v)
-
-    def on_ok(self):
-        cat=self.cat_cb.currentText()
-        val=self.val_cb.currentText()
-        if not cat or not val:
-            QMessageBox.warning(self,"PivotWizard","Must pick category & value col.")
-            return
-        self.category_col=cat
-        self.value_col=val
-        self.distinct_vals=[it.text() for it in self.val_list.selectedItems()]
-        self.accept()
-
-    def build_expressions(self):
-        arr=[]
-        for dv in self.distinct_vals:
-            alias=dv.lower().replace(" ","_")+"_val"
-            expr=f"SUM(CASE WHEN {self.category_col}='{dv}' THEN {self.value_col} END) AS {alias}"
-            arr.append(expr)
-        return arr
-
-class GroupByPanel(QGroupBox):
-    def __init__(self,builder,parent=None):
-        super().__init__("Group By & Aggregates (+Pivot)",parent)
-        self.builder=builder
-        layout=QVBoxLayout(self)
-        self.setLayout(layout)
-
-        self.gb_table=QTableWidget(0,1)
-        self.gb_table.setHorizontalHeaderLabels(["Group By Columns"])
-        self.gb_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.gb_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        layout.addWidget(self.gb_table)
-
-        gb_h=QHBoxLayout()
-        add_gb=QPushButton("Add GroupBy")
-        add_gb.clicked.connect(self.add_group_by)
-        rm_gb=QPushButton("Remove GroupBy")
-        rm_gb.clicked.connect(self.remove_group_by)
-        gb_h.addWidget(add_gb)
-        gb_h.addWidget(rm_gb)
-        layout.addLayout(gb_h)
-
-        self.agg_table=QTableWidget(0,3)
-        self.agg_table.setHorizontalHeaderLabels(["Function","Column","Alias"])
-        self.agg_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.agg_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        layout.addWidget(self.agg_table)
-
-        agg_h=QHBoxLayout()
-        add_agg=QPushButton("Add Agg")
-        add_agg.clicked.connect(self.add_agg)
-        rm_agg=QPushButton("Remove Agg")
-        rm_agg.clicked.connect(self.remove_agg)
-        agg_h.addWidget(add_agg)
-        agg_h.addWidget(rm_agg)
-        layout.addLayout(agg_h)
-
-        pivot_btn=QPushButton("Pivot Wizard")
-        pivot_btn.clicked.connect(self.launch_pivot)
-        layout.addWidget(pivot_btn)
-
-    def add_group_by(self):
-        cols=self.builder.get_all_possible_columns_for_dialog()
-        if not cols:
-            QMessageBox.warning(self,"No Columns","No columns available.")
-            return
-        (c,ok)=QtWidgets.QInputDialog.getItem(self,"Add GroupBy","Pick column:",cols,0,False)
-        if ok and c:
-            rr=self.gb_table.rowCount()
-            self.gb_table.insertRow(rr)
-            self.gb_table.setItem(rr,0,QTableWidgetItem(c))
-            if self.builder.auto_generate:
-                self.builder.generate_sql()
-
-    def remove_group_by(self):
-        rows=sorted([x.row() for x in self.gb_table.selectionModel().selectedRows()],reverse=True)
-        for rr in rows:
-            self.gb_table.removeRow(rr)
-        if self.builder.auto_generate:
-            self.builder.generate_sql()
-
-    def add_agg(self):
-        cols=self.builder.get_all_possible_columns_for_dialog()
-        if not cols:
-            QMessageBox.warning(self,"No Columns","No columns available.")
-            return
-        d=QDialog(self)
-        d.setWindowTitle("Add Aggregate")
-        fl=QFormLayout(d)
-        func_cb=QComboBox()
-        func_cb.addItems(["COUNT","SUM","AVG","MIN","MAX","CUSTOM"])
-        col_cb=QComboBox()
-        col_cb.addItems(cols)
-        alias_ed=QLineEdit("AggVal")
-        fl.addRow("Function:",func_cb)
-        fl.addRow("Column:",col_cb)
-        fl.addRow("Alias:",alias_ed)
-        btns=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
-        fl.addWidget(btns)
-        def on_ok():
-            if not col_cb.currentText():
-                QMessageBox.warning(d,"No col","Pick a column.")
-                return
-            d.accept()
-        btns.accepted.connect(on_ok)
-        btns.rejected.connect(d.reject)
-        d.setLayout(fl)
-        if d.exec_()==QDialog.Accepted:
-            f=func_cb.currentText()
-            c=col_cb.currentText()
-            a=alias_ed.text().strip()
-            rr=self.agg_table.rowCount()
-            self.agg_table.insertRow(rr)
-            self.agg_table.setItem(rr,0,QTableWidgetItem(f))
-            self.agg_table.setItem(rr,1,QTableWidgetItem(c))
-            self.agg_table.setItem(rr,2,QTableWidgetItem(a))
-            if self.builder.auto_generate:
-                self.builder.generate_sql()
-
-    def remove_agg(self):
-        rows=sorted([x.row() for x in self.agg_table.selectionModel().selectedRows()],reverse=True)
-        for rr in rows:
-            self.agg_table.removeRow(rr)
-        if self.builder.auto_generate:
-            self.builder.generate_sql()
-
-    def launch_pivot(self):
-        cols=self.builder.get_all_possible_columns_for_dialog()
-        if not cols:
-            QMessageBox.warning(self,"No columns","No columns available.")
-            return
-        dlg=PivotDialog(cols,self)
-        if dlg.exec_()==QDialog.Accepted:
-            exs=dlg.build_expressions()
-            for ex in exs:
-                rr=self.agg_table.rowCount()
-                self.agg_table.insertRow(rr)
-                self.agg_table.setItem(rr,0,QTableWidgetItem("CUSTOM"))
-                self.agg_table.setItem(rr,1,QTableWidgetItem(ex))
-                self.agg_table.setItem(rr,2,QTableWidgetItem("PivotVal"))
-            if self.builder.auto_generate:
-                self.builder.generate_sql()
-
-    def get_group_by(self):
-        arr=[]
-        for r in range(self.gb_table.rowCount()):
-            it=self.gb_table.item(r,0)
-            arr.append(it.text())
-        return arr
-
-    def get_aggregates(self):
-        ags=[]
-        for r in range(self.agg_table.rowCount()):
-            f=self.agg_table.item(r,0).text()
-            c=self.agg_table.item(r,1).text()
-            a=self.agg_table.item(r,2).text()
-            ags.append((f,c,a))
-        return ags
-
-class SortLimitPanel(QGroupBox):
-    def __init__(self,builder,parent=None):
-        super().__init__("Sort and Limit",parent)
-        self.builder=builder
-        layout=QVBoxLayout(self)
-        self.setLayout(layout)
-
-        self.sort_table=QTableWidget(0,2)
-        self.sort_table.setHorizontalHeaderLabels(["Column","Direction"])
-        self.sort_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.sort_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        layout.addWidget(self.sort_table)
-
-        btn_h=QHBoxLayout()
-        add_s=QPushButton("Add Sort")
-        add_s.clicked.connect(self.add_sort_dialog)
-        rm_s=QPushButton("Remove Sort")
-        rm_s.clicked.connect(self.remove_sort)
-        btn_h.addWidget(add_s)
-        btn_h.addWidget(rm_s)
-        layout.addLayout(btn_h)
-
-        lo_h=QHBoxLayout()
-        self.limit_spin=QSpinBox()
-        self.limit_spin.setRange(0,9999999)
-        self.limit_spin.setValue(0)
-        self.limit_spin.setSuffix(" (Limit)")
-        self.limit_spin.setSpecialValueText("No Limit")
-        self.limit_spin.valueChanged.connect(self._maybe_regen)
-        lo_h.addWidget(self.limit_spin)
-
-        self.offset_spin=QSpinBox()
-        self.offset_spin.setRange(0,9999999)
-        self.offset_spin.setValue(0)
-        self.offset_spin.setSuffix(" (Offset)")
-        self.offset_spin.setSpecialValueText("No Offset")
-        self.offset_spin.valueChanged.connect(self._maybe_regen)
-        lo_h.addWidget(self.offset_spin)
-
-        layout.addLayout(lo_h)
-
-    def _maybe_regen(self):
-        if self.builder.auto_generate:
-            self.builder.generate_sql()
-
-    def add_sort_dialog(self):
-        cols=self.builder.get_all_possible_columns_for_dialog()
-        if not cols:
-            QMessageBox.warning(self,"No columns","No columns available.")
-            return
-        d=QDialog(self)
-        d.setWindowTitle("Add Sort")
-        fl=QFormLayout(d)
-        col_cb=QComboBox()
-        col_cb.addItems(cols)
-        dir_cb=QComboBox()
-        dir_cb.addItems(["ASC","DESC"])
-        fl.addRow("Column:",col_cb)
-        fl.addRow("Direction:",dir_cb)
-        btns=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
-        fl.addWidget(btns)
-        def on_ok():
-            if not col_cb.currentText():
-                QMessageBox.warning(d,"No col","Pick a column.")
-                return
-            d.accept()
-        btns.accepted.connect(on_ok)
-        btns.rejected.connect(d.reject)
-        d.setLayout(fl)
-        if d.exec_()==QDialog.Accepted:
-            c=col_cb.currentText()
-            dd=dir_cb.currentText()
-            rr=self.sort_table.rowCount()
-            self.sort_table.insertRow(rr)
-            self.sort_table.setItem(rr,0,QTableWidgetItem(c))
-            self.sort_table.setItem(rr,1,QTableWidgetItem(dd))
-            if self.builder.auto_generate:
-                self.builder.generate_sql()
-
-    def remove_sort(self):
-        rows=sorted([x.row() for x in self.sort_table.selectionModel().selectedRows()],reverse=True)
-        for rr in rows:
-            self.sort_table.removeRow(rr)
-        if self.builder.auto_generate:
-            self.builder.generate_sql()
-
-    def get_order_bys(self):
-        arr=[]
-        for r in range(self.sort_table.rowCount()):
-            cc=self.sort_table.item(r,0).text()
-            dd=self.sort_table.item(r,1).text()
-            arr.append(f"{cc} {dd}")
-        return arr
-
-    def get_limit(self):
-        v=self.limit_spin.value()
-        return v if v>0 else None
-
-    def get_offset(self):
-        v=self.offset_spin.value()
-        return v if v>0 else None
-
-###############################################################################
-# 11) SQLImportTab
-###############################################################################
-class SQLImportTab(QWidget):
-    def __init__(self,builder=None,parent=None):
-        super().__init__(parent)
-        self.builder=builder
-        layout=QVBoxLayout(self)
-        inst=QLabel("Paste or type your SQL below, then click 'Import'. We'll parse it.")
-        layout.addWidget(inst)
-
-        self.sql_edit=QTextEdit()
-        layout.addWidget(self.sql_edit)
-
-        btn=QPushButton("Import SQL")
-        btn.clicked.connect(self.on_import)
-        layout.addWidget(btn)
-
-        self.setLayout(layout)
-
-    def on_import(self):
-        raw=self.sql_edit.toPlainText().strip()
-        if not raw:
-            QMessageBox.information(self,"Empty SQL","No SQL to parse.")
-            return
-        try:
-            parser=FullSQLParser(raw)
-            parser.parse()
-            QMessageBox.information(self,"Import OK","SQL parse succeeded.")
-        except Exception as ex:
-            QMessageBox.warning(self,"Import Error",f"{ex}")
-
-###############################################################################
-# 12) EnhancedCanvasGraphicsView
+# BFS Canvas
 ###############################################################################
 class EnhancedCanvasGraphicsView(QGraphicsView):
-    def __init__(self,builder,parent=None):
+    def __init__(self, builder, parent=None):
         super().__init__(parent)
-        self.builder=builder
-        self.scene_=QGraphicsScene(self)
+        self.builder= builder
+        self.setAcceptDrops(True)
+
+        self.scene_= QGraphicsScene(self)
         self.setScene(self.scene_)
-        self.setRenderHint(QtGui.QPainter.Antialiasing)
-        self.setDragMode(QtWidgets.QGraphicsView.RubberBandDrag)
 
         self.table_items={}
         self.join_lines=[]
         self.mapping_lines=[]
-        self.operation_red_line=None
-        self.complete_query_item=None
-        self.target_table_item=None
+        self.operation_red_line= None
 
-        self.zoom_factor=1.25
-        self.min_scale=0.1
-        self.max_scale=8.0
-
-        self.validation_timer=QTimer()
-        self.validation_timer.setInterval(800)
+        self.validation_timer= QTimer()
+        self.validation_timer.setInterval(400)
         self.validation_timer.setSingleShot(True)
         self.validation_timer.timeout.connect(self.builder.validate_sql)
-
-    def wheelEvent(self,event):
-        if event.angleDelta().y()>0:
-            z=self.zoom_factor
-        else:
-            z=1/self.zoom_factor
-        c=self.transform().m11()
-        ns=c*z
-        if self.min_scale<ns<self.max_scale:
-            self.scale(z,z)
 
     def dragEnterEvent(self,e):
         if e.mimeData().hasText():
@@ -1481,38 +986,50 @@ class EnhancedCanvasGraphicsView(QGraphicsView):
         e.acceptProposedAction()
 
     def dropEvent(self,e):
-        txt=e.mimeData().text()
-        pos=self.mapToScene(e.pos())
-        self.builder.handle_drop(txt,pos)
+        txt= e.mimeData().text()
+        pos= self.mapToScene(e.pos())
+        self.builder.handle_drop(txt, pos)
         e.acceptProposedAction()
 
-    def add_table_item(self, table_name, columns, x, y):
-        itm=CollapsibleTableGraphicsItem(table_name,columns,self.builder,x,y)
-        self.scene_.addItem(itm)
-        self.table_items[table_name]=itm
+    def add_table_item(self, table_key, columns, x, y):
+        item= CollapsibleTableGraphicsItem(table_key, columns, self.builder, x, y)
+        self.scene_.addItem(item)
+        self.table_items[table_key]= item
         if self.builder.auto_generate:
             self.builder.generate_sql()
         self.validation_timer.start()
 
-    def add_subquery_item(self, x, y):
-        sq=NestedSubqueryItem(parent_builder=self.builder,x=x,y=y)
-        self.scene_.addItem(sq)
-        key=f"SubQueryItem_{id(sq)}"
-        self.table_items[key]=sq
-        self.validation_timer.start()
-
     def remove_table_item(self, table_key):
         if table_key in self.table_items:
-            itm=self.table_items[table_key]
-            lines_to_remove=[]
+            it= self.table_items[table_key]
+            # remove lines referencing it
+            to_rm=[]
             for jl in self.join_lines:
-                if jl.start_item==itm or jl.end_item==itm:
-                    lines_to_remove.append(jl)
+                if jl.start_item== it or jl.end_item== it:
+                    to_rm.append(jl)
+            for ml in self.mapping_lines:
+                # no BFS item, but check if it belongs
+                pass
+                # We'll also check if ml belongs. We'll do a check if ml's source_text_item or target_text_item is in "it"
+            # Actually easier approach: check the BFS lines on scene
+            lines_to_remove=[]
+            for ln in self.scene_.items():
+                if isinstance(ln, JoinLine):
+                    if ln.start_item== it or ln.end_item== it:
+                        lines_to_remove.append(ln)
+                if isinstance(ln, MappingLine):
+                    # see if the text item belongs to it
+                    pass
+                    # We'll do a bounding approach or cross reference
             for ln in lines_to_remove:
                 self.scene_.removeItem(ln)
-                self.join_lines.remove(ln)
-            self.scene_.removeItem(itm)
+                if ln in self.join_lines:
+                    self.join_lines.remove(ln)
+
+            self.scene_.removeItem(it)
             del self.table_items[table_key]
+            if self.builder.auto_generate:
+                self.builder.generate_sql()
             self.validation_timer.start()
 
     def remove_mapping_lines(self):
@@ -1524,142 +1041,1316 @@ class EnhancedCanvasGraphicsView(QGraphicsView):
         if self.operation_red_line:
             self.scene_.removeItem(self.operation_red_line)
             self.operation_red_line=None
-        ln=QGraphicsLineItem(x,0,x,3000)
-        ln.setPen(QPen(Qt.red,2,Qt.DashDotLine))
-        ln.setZValue(-10)
-        self.scene_.addItem(ln)
-        self.operation_red_line=ln
+        line= QGraphicsLineItem(x,0,x,9999)
+        line.setPen(QPen(Qt.red,2,Qt.DashDotLine))
+        line.setZValue(-10)
+        self.scene_.addItem(line)
+        self.operation_red_line= line
 
-    def create_mapping_line(self, source_text_item, target_text_item,
-                            src_type=None, tgt_type=None):
-        ml=MappingLine(source_text_item,target_text_item,src_type,tgt_type)
+    def create_mapping_line(self, source_txt_item, target_txt_item, stype=None, ttype=None):
+        ml= MappingLine(source_txt_item, target_txt_item, self, stype, ttype)
         self.scene_.addItem(ml)
         self.mapping_lines.append(ml)
         if self.builder.auto_generate:
             self.builder.generate_sql()
         self.validation_timer.start()
 
-    def mouseReleaseEvent(self,event):
-        super().mouseReleaseEvent(event)
-        for jl in self.join_lines:
-            jl.update_line()
+    def mouseReleaseEvent(self,e):
+        super().mouseReleaseEvent(e)
+        for j in self.join_lines:
+            j.update_line()
         for ml in self.mapping_lines:
             ml.update_pos()
 
-    def update_lines_for_item(self, moved_item):
-        for jl in self.join_lines:
-            if jl.start_item==moved_item or jl.end_item==moved_item:
-                jl.update_line()
-        for ml in self.mapping_lines:
-            srcp=ml.source_text_item.parentItem()
-            tgtp=ml.target_text_item.parentItem()
-            if srcp==moved_item or tgtp==moved_item:
-                ml.update_pos()
+###############################################################################
+# FilterPanel, GroupByPanel, Aggregates, PivotWizard, SortLimit, WindowFunction
+###############################################################################
+class PivotWizardDialog(QDialog):
+    """
+    Minimal pivot wizard => sums with CASE WHEN category= ...
+    """
+    def __init__(self, available_cols, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Pivot Wizard")
+        self.resize(500,400)
+        self.available_cols= available_cols
+        self.category_col= None
+        self.value_col= None
+        self.distinct_vals=[]
+
+        main= QVBoxLayout(self)
+        form= QFormLayout()
+        self.cat_combo= QComboBox()
+        self.cat_combo.addItems(available_cols)
+        form.addRow("Category Column:", self.cat_combo)
+        self.val_combo= QComboBox()
+        self.val_combo.addItems(available_cols)
+        form.addRow("Value Column:", self.val_combo)
+        main.addLayout(form)
+
+        main.addWidget(QLabel("Choose categories (for demonstration)."))
+        self.dist_list= QListWidget()
+        self.dist_list.setSelectionMode(QAbstractItemView.MultiSelection)
+        main.addWidget(self.dist_list)
+
+        load_btn= QPushButton("Load Distinct (Demo Only)")
+        def do_load():
+            self.dist_list.clear()
+            for v in ["Manager","Clerk","Sales","IT","HR"]:
+                self.dist_list.addItem(v)
+        load_btn.clicked.connect(do_load)
+        main.addWidget(load_btn)
+
+        dbb= QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
+        main.addWidget(dbb)
+        dbb.accepted.connect(self.on_ok)
+        dbb.rejected.connect(self.reject)
+        self.setLayout(main)
+
+    def on_ok(self):
+        cat= self.cat_combo.currentText()
+        val= self.val_combo.currentText()
+        if not cat or not val:
+            QMessageBox.warning(self,"PivotWizard","Pick category & value col.")
+            return
+        self.category_col= cat
+        self.value_col= val
+        self.distinct_vals= [it.text() for it in self.dist_list.selectedItems()]
+        self.accept()
+
+    def build_expressions(self):
+        arr=[]
+        for dv in self.distinct_vals:
+            alias= dv.lower().replace(" ","_")+"_val"
+            expr= f"SUM(CASE WHEN {self.category_col}='{dv}' THEN {self.value_col} END) AS {alias}"
+            arr.append(expr)
+        return arr
+
+
+class AddFilterDialog(QDialog):
+    def __init__(self, avail_cols, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add Filter")
+        self.selected_col=None
+        self.selected_op=None
+        self.selected_val=None
+        lay= QFormLayout(self)
+        self.col_combo= QComboBox()
+        self.col_combo.addItems(avail_cols)
+        lay.addRow("Column:", self.col_combo)
+
+        self.op_combo= QComboBox()
+        self.op_combo.addItems(["=","<>","<",">","<=",">=","IS NULL","IS NOT NULL"])
+        lay.addRow("Operator:", self.op_combo)
+
+        self.val_edit= QLineEdit("'ABC'")
+        lay.addRow("Value:", self.val_edit)
+
+        dbb= QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
+        lay.addWidget(dbb)
+        dbb.accepted.connect(self.on_ok)
+        dbb.rejected.connect(self.reject)
+        self.setLayout(lay)
+
+    def on_ok(self):
+        c= self.col_combo.currentText()
+        if not c:
+            QMessageBox.warning(self,"No col","Need a column.")
+            return
+        self.selected_col= c
+        self.selected_op= self.op_combo.currentText()
+        self.selected_val= self.val_edit.text().strip()
+        self.accept()
+
+    def get_filter(self):
+        return (self.selected_col, self.selected_op, self.selected_val)
+
+class FilterPanel(QGroupBox):
+    def __init__(self,builder,parent=None):
+        super().__init__("Filters", parent)
+        self.builder= builder
+        main= QVBoxLayout(self)
+        self.setLayout(main)
+
+        self.tabs= QTabWidget()
+        main.addWidget(self.tabs)
+
+        self.where_tab= QWidget()
+        self.having_tab= QWidget()
+        self.tabs.addTab(self.where_tab,"WHERE")
+        self.tabs.addTab(self.having_tab,"HAVING")
+
+        # WHERE
+        wLay= QVBoxLayout(self.where_tab)
+        self.where_table= QTableWidget(0,3)
+        self.where_table.setHorizontalHeaderLabels(["Column","Operator","Value"])
+        self.where_table.horizontalHeader().setStretchLastSection(True)
+        self.where_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.where_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        wLay.addWidget(self.where_table)
+
+        wh_b= QHBoxLayout()
+        add_w= QPushButton("Add WHERE")
+        rm_w= QPushButton("Remove WHERE")
+        wh_b.addWidget(add_w)
+        wh_b.addWidget(rm_w)
+        wLay.addLayout(wh_b)
+
+        add_w.clicked.connect(lambda: self.add_filter("WHERE"))
+        rm_w.clicked.connect(lambda: self.remove_filter("WHERE"))
+
+        # HAVING
+        hLay= QVBoxLayout(self.having_tab)
+        self.having_table= QTableWidget(0,3)
+        self.having_table.setHorizontalHeaderLabels(["Column","Operator","Value"])
+        self.having_table.horizontalHeader().setStretchLastSection(True)
+        self.having_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.having_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        hLay.addWidget(self.having_table)
+
+        hv_b= QHBoxLayout()
+        add_h= QPushButton("Add HAVING")
+        rm_h= QPushButton("Remove HAVING")
+        hv_b.addWidget(add_h)
+        hv_b.addWidget(rm_h)
+        hLay.addLayout(hv_b)
+
+        add_h.clicked.connect(lambda: self.add_filter("HAVING"))
+        rm_h.clicked.connect(lambda: self.remove_filter("HAVING"))
+
+    def add_filter(self, clause):
+        cols=self.builder.get_all_possible_columns_for_dialog()
+        if not cols:
+            QMessageBox.warning(self,"No columns","No columns to filter.")
+            return
+        dlg= AddFilterDialog(cols,self)
+        if dlg.exec_()== QDialog.Accepted:
+            c,o,v= dlg.get_filter()
+            if clause=="WHERE":
+                tb= self.where_table
+            else:
+                tb= self.having_table
+            r= tb.rowCount()
+            tb.insertRow(r)
+            tb.setItem(r,0,QTableWidgetItem(c))
+            tb.setItem(r,1,QTableWidgetItem(o))
+            tb.setItem(r,2,QTableWidgetItem(v))
+            if self.builder.auto_generate:
+                self.builder.generate_sql()
+
+    def remove_filter(self, clause):
+        if clause=="WHERE":
+            tb= self.where_table
+        else:
+            tb= self.having_table
+        rows= sorted([x.row() for x in tb.selectionModel().selectedRows()], reverse=True)
+        for rr in rows:
+            tb.removeRow(rr)
+        if self.builder.auto_generate:
+            self.builder.generate_sql()
+
+    def get_filters(self,clause):
+        if clause=="WHERE":
+            tb= self.where_table
+        else:
+            tb= self.having_table
+        arr=[]
+        for r in range(tb.rowCount()):
+            c= tb.item(r,0).text()
+            o= tb.item(r,1).text()
+            v= tb.item(r,2).text()
+            arr.append((c,o,v))
+        return arr
+
+class GroupByPanel(QGroupBox):
+    def __init__(self,builder,parent=None):
+        super().__init__("Group By", parent)
+        self.builder= builder
+        main= QVBoxLayout(self)
+        self.setLayout(main)
+
+        self.gb_table= QTableWidget(0,1)
+        self.gb_table.setHorizontalHeaderLabels(["GroupBy Column"])
+        self.gb_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.gb_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        main.addWidget(self.gb_table)
+
+        row= QHBoxLayout()
+        add_gb= QPushButton("Add GroupBy")
+        rm_gb= QPushButton("Remove GroupBy")
+        row.addWidget(add_gb)
+        row.addWidget(rm_gb)
+        main.addLayout(row)
+
+        add_gb.clicked.connect(self.add_group)
+        rm_gb.clicked.connect(self.remove_group)
+
+    def add_group(self):
+        cols=self.builder.get_all_possible_columns_for_dialog()
+        if not cols:
+            QMessageBox.warning(self,"No columns","No columns available.")
+            return
+        (col,ok)= QtWidgets.QInputDialog.getItem(self,"Add GroupBy","Column:", cols, 0, False)
+        if ok and col:
+            r= self.gb_table.rowCount()
+            self.gb_table.insertRow(r)
+            self.gb_table.setItem(r,0,QTableWidgetItem(col))
+            if self.builder.auto_generate:
+                self.builder.generate_sql()
+
+    def remove_group(self):
+        rows= sorted([x.row() for x in self.gb_table.selectionModel().selectedRows()], reverse=True)
+        for rr in rows:
+            self.gb_table.removeRow(rr)
+        if self.builder.auto_generate:
+            self.builder.generate_sql()
+
+    def get_group_by(self):
+        arr=[]
+        for r in range(self.gb_table.rowCount()):
+            it= self.gb_table.item(r,0)
+            arr.append(it.text())
+        return arr
+
+class GroupAggPanel(QGroupBox):
+    def __init__(self,builder,parent=None):
+        super().__init__("Aggregates", parent)
+        self.builder= builder
+        main= QVBoxLayout(self)
+        self.setLayout(main)
+
+        self.agg_table= QTableWidget(0,3)
+        self.agg_table.setHorizontalHeaderLabels(["Function","Column","Alias"])
+        self.agg_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.agg_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        main.addWidget(self.agg_table)
+
+        row= QHBoxLayout()
+        add_a= QPushButton("Add Agg")
+        rm_a= QPushButton("Remove Agg")
+        row.addWidget(add_a)
+        row.addWidget(rm_a)
+        main.addLayout(row)
+
+        add_a.clicked.connect(self.add_agg)
+        rm_a.clicked.connect(self.remove_agg)
+
+    def add_agg(self):
+        cols=self.builder.get_all_possible_columns_for_dialog()
+        if not cols:
+            QMessageBox.warning(self,"No columns","No columns available.")
+            return
+        d= QDialog(self)
+        d.setWindowTitle("Add Aggregate")
+        fl= QFormLayout(d)
+        func_cb= QComboBox()
+        func_cb.addItems(["COUNT","SUM","AVG","MIN","MAX","CUSTOM"])
+        col_cb= QComboBox()
+        col_cb.addItems(cols)
+        alias_ed= QLineEdit("AggVal")
+        fl.addRow("Function:", func_cb)
+        fl.addRow("Column:", col_cb)
+        fl.addRow("Alias:", alias_ed)
+
+        dbb= QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
+        fl.addWidget(dbb)
+        def okclick():
+            if not col_cb.currentText() and func_cb.currentText()!="CUSTOM":
+                QMessageBox.warning(d,"Error","Pick a column or use CUSTOM.")
+                return
+            d.accept()
+        dbb.accepted.connect(okclick)
+        dbb.rejected.connect(d.reject)
+        d.setLayout(fl)
+        if d.exec_()== QDialog.Accepted:
+            f= func_cb.currentText()
+            c= col_cb.currentText()
+            a= alias_ed.text().strip()
+            r= self.agg_table.rowCount()
+            self.agg_table.insertRow(r)
+            self.agg_table.setItem(r,0,QTableWidgetItem(f))
+            self.agg_table.setItem(r,1,QTableWidgetItem(c))
+            self.agg_table.setItem(r,2,QTableWidgetItem(a))
+            if self.builder.auto_generate:
+                self.builder.generate_sql()
+
+    def remove_agg(self):
+        rows= sorted([x.row() for x in self.agg_table.selectionModel().selectedRows()],reverse=True)
+        for rr in rows:
+            self.agg_table.removeRow(rr)
+        if self.builder.auto_generate:
+            self.builder.generate_sql()
+
+    def get_aggregates(self):
+        out=[]
+        for r in range(self.agg_table.rowCount()):
+            f=self.agg_table.item(r,0).text()
+            c=self.agg_table.item(r,1).text()
+            a=self.agg_table.item(r,2).text()
+            out.append((f,c,a))
+        return out
+
+class SortLimitPanel(QGroupBox):
+    def __init__(self,builder,parent=None):
+        super().__init__("Sort & Limit", parent)
+        self.builder= builder
+        main= QVBoxLayout(self)
+        self.setLayout(main)
+
+        self.sort_table= QTableWidget(0,2)
+        self.sort_table.setHorizontalHeaderLabels(["Column","Direction"])
+        self.sort_table.horizontalHeader().setStretchLastSection(True)
+        self.sort_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.sort_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        main.addWidget(self.sort_table)
+
+        row= QHBoxLayout()
+        add_s= QPushButton("Add Sort")
+        rm_s= QPushButton("Remove Sort")
+        row.addWidget(add_s)
+        row.addWidget(rm_s)
+        main.addLayout(row)
+
+        add_s.clicked.connect(self.add_sort)
+        rm_s.clicked.connect(self.remove_sort)
+
+        hr= QHBoxLayout()
+        self.limit_spin= QSpinBox()
+        self.limit_spin.setRange(0,9999999)
+        self.limit_spin.setValue(0)
+        self.limit_spin.setSuffix(" (Limit)")
+        self.limit_spin.setSpecialValueText("No Limit")
+        self.limit_spin.valueChanged.connect(self.maybe_regen)
+        hr.addWidget(self.limit_spin)
+
+        self.offset_spin= QSpinBox()
+        self.offset_spin.setRange(0,9999999)
+        self.offset_spin.setValue(0)
+        self.offset_spin.setSuffix(" (Offset)")
+        self.offset_spin.setSpecialValueText("No Offset")
+        self.offset_spin.valueChanged.connect(self.maybe_regen)
+        hr.addWidget(self.offset_spin)
+
+        main.addLayout(hr)
+
+    def maybe_regen(self):
+        if self.builder.auto_generate:
+            self.builder.generate_sql()
+
+    def add_sort(self):
+        cols= self.builder.get_all_possible_columns_for_dialog()
+        if not cols:
+            QMessageBox.warning(self,"No columns","No columns available.")
+            return
+        d= QDialog(self)
+        d.setWindowTitle("Add Sort")
+        fl= QFormLayout(d)
+        col_cb= QComboBox()
+        col_cb.addItems(cols)
+        dir_cb= QComboBox()
+        dir_cb.addItems(["ASC","DESC"])
+        fl.addRow("Column:", col_cb)
+        fl.addRow("Direction:", dir_cb)
+        dbb= QDialogButtonBox(QDialogButtonBox.Ok| QDialogButtonBox.Cancel)
+        fl.addWidget(dbb)
+        def okcl():
+            if not col_cb.currentText():
+                QMessageBox.warning(d,"No column","Must pick column.")
+                return
+            d.accept()
+        dbb.accepted.connect(okcl)
+        dbb.rejected.connect(d.reject)
+        d.setLayout(fl)
+        if d.exec_()== QDialog.Accepted:
+            c= col_cb.currentText()
+            dd= dir_cb.currentText()
+            r= self.sort_table.rowCount()
+            self.sort_table.insertRow(r)
+            self.sort_table.setItem(r,0,QTableWidgetItem(c))
+            self.sort_table.setItem(r,1,QTableWidgetItem(dd))
+            if self.builder.auto_generate:
+                self.builder.generate_sql()
+
+    def remove_sort(self):
+        rows= sorted([x.row() for x in self.sort_table.selectionModel().selectedRows()], reverse=True)
+        for rr in rows:
+            self.sort_table.removeRow(rr)
+        if self.builder.auto_generate:
+            self.builder.generate_sql()
+
+    def get_order_bys(self):
+        arr=[]
+        for r in range(self.sort_table.rowCount()):
+            c= self.sort_table.item(r,0).text()
+            dr= self.sort_table.item(r,1).text()
+            arr.append(f"{c} {dr}")
+        return arr
+
+    def get_limit(self):
+        val= self.limit_spin.value()
+        return val if val>0 else None
+
+    def get_offset(self):
+        val= self.offset_spin.value()
+        return val if val>0 else None
 
 ###############################################################################
-# 13) SubVQBDialog (already done above)
-# 14) A small ResultDataDialog to show sample rows
+# Advanced Expression Builder => token-based
+###############################################################################
+class CaseWizardDialog(QDialog):
+    def __init__(self, available_columns, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("CASE Wizard")
+        self.resize(500,400)
+        self.available_columns= available_columns
+        self.when_clauses=[]
+        self.else_expr=""
+
+        main= QVBoxLayout(self)
+        self.preview= QTextEdit()
+        self.preview.setReadOnly(True)
+        main.addWidget(self.preview)
+
+        row= QHBoxLayout()
+        add_w= QPushButton("Add WHEN")
+        rm_w= QPushButton("Remove WHEN")
+        row.addWidget(add_w)
+        row.addWidget(rm_w)
+        main.addLayout(row)
+
+        def add_when():
+            cd,ok= QtWidgets.QInputDialog.getText(self,"CASE: WHEN cond","Enter condition (col=val):")
+            if not ok or not cd.strip():
+                return
+            rs,ok2= QtWidgets.QInputDialog.getText(self,"CASE: THEN result","Result (literal or col):")
+            if not ok2:
+                return
+            self.when_clauses.append((cd.strip(), rs.strip()))
+            self.update_preview()
+
+        def rm_when():
+            if self.when_clauses:
+                self.when_clauses.pop()
+            self.update_preview()
+
+        add_w.clicked.connect(add_when)
+        rm_w.clicked.connect(rm_when)
+
+        row2= QHBoxLayout()
+        row2.addWidget(QLabel("ELSE:"))
+        self.else_edit= QLineEdit()
+        row2.addWidget(self.else_edit)
+        main.addLayout(row2)
+
+        dbb= QDialogButtonBox(QDialogButtonBox.Ok| QDialogButtonBox.Cancel)
+        main.addWidget(dbb)
+        dbb.accepted.connect(self.on_ok)
+        dbb.rejected.connect(self.reject)
+        self.setLayout(main)
+
+    def update_preview(self):
+        lines=["CASE"]
+        for (c,r) in self.when_clauses:
+            lines.append(f"  WHEN {c} THEN {r}")
+        if self.else_expr.strip():
+            lines.append(f"  ELSE {self.else_expr}")
+        lines.append("END")
+        self.preview.setPlainText("\n".join(lines))
+
+    def on_ok(self):
+        self.else_expr= self.else_edit.text().strip()
+        self.update_preview()
+        self.accept()
+
+    def get_case_expression(self):
+        lines=["CASE"]
+        for (c,r) in self.when_clauses:
+            lines.append(f"  WHEN {c} THEN {r}")
+        if self.else_expr.strip():
+            lines.append(f"  ELSE {self.else_expr}")
+        lines.append("END")
+        return "\n".join(lines)
+
+
+class SubqueryStubDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Subquery Editor")
+        self.resize(600,400)
+        self.result_sql=""
+
+        main= QVBoxLayout(self)
+        main.addWidget(QLabel("Type a single-column SELECT subquery:"))
+        self.sub_edit= QTextEdit()
+        main.addWidget(self.sub_edit)
+
+        dbb= QDialogButtonBox(QDialogButtonBox.Ok| QDialogButtonBox.Cancel)
+        main.addWidget(dbb)
+        dbb.accepted.connect(self.on_ok)
+        dbb.rejected.connect(self.reject)
+        self.setLayout(main)
+
+    def on_ok(self):
+        raw= self.sub_edit.toPlainText().strip()
+        if not raw.lower().startswith("select"):
+            QMessageBox.warning(self,"No SELECT","Must start with SELECT")
+            return
+        self.result_sql= f"({raw})"
+        self.accept()
+
+    def get_subquery(self):
+        return self.result_sql
+
+
+class ExprTokenWidget(QFrame):
+    def __init__(self, token_text, parent=None):
+        super().__init__(parent)
+        self.token_text= token_text
+        self.setFrameShape(QFrame.Box)
+        self.setLineWidth(1)
+        self.setStyleSheet("background-color: #f0f0f0;")
+        lay= QHBoxLayout(self)
+        lbl= QLabel(token_text)
+        lbl.setStyleSheet("padding: 2px;")
+        lay.addWidget(lbl)
+        self.setLayout(lay)
+
+    def contextMenuEvent(self, e):
+        menu= QMenu()
+        rm= menu.addAction("Remove Token")
+        chosen= menu.exec_(e.globalPos())
+        if chosen== rm:
+            self.setParent(None)
+
+
+class TokenFlowArea(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.main_layout= QHBoxLayout(self)
+        self.main_layout.addStretch()
+        self.setLayout(self.main_layout)
+
+    def add_token(self, txt):
+        w= ExprTokenWidget(txt, self)
+        idx= self.main_layout.count() - 1
+        self.main_layout.insertWidget(idx, w)
+
+    def get_tokens(self):
+        tokens=[]
+        for i in range(self.main_layout.count()):
+            ww= self.main_layout.itemAt(i).widget()
+            if isinstance(ww, ExprTokenWidget):
+                tokens.append(ww.token_text)
+        return tokens
+
+
+class AdvancedExpressionBuilderDialog(QDialog):
+    def __init__(self, available_columns, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Advanced Expression Builder")
+        self.resize(900,600)
+        self.available_columns= available_columns or []
+
+        main= QHBoxLayout(self)
+        self.setLayout(main)
+
+        leftp= QVBoxLayout()
+        self.col_list= QListWidget()
+        for c in self.available_columns:
+            self.col_list.addItem(c)
+        leftp.addWidget(QLabel("Columns (double-click to insert):"))
+        leftp.addWidget(self.col_list,1)
+
+        self.op_list= QListWidget()
+        op_items= [
+            "(", ")", "+","-","*","/","=","<",">","<=",">=","<>","AND","OR","NOT",
+            "LIKE","IN","IS NULL","IS NOT NULL",
+            "SUM(","AVG(","MIN(","MAX(","COUNT(","UPPER(","LOWER(","TRIM(","COALESCE(",
+            "CASE (Wizard)", "SUBQUERY"
+        ]
+        for it in op_items:
+            self.op_list.addItem(it)
+        leftp.addWidget(QLabel("Operators / Functions:"))
+        leftp.addWidget(self.op_list,1)
+
+        l_container= QWidget()
+        l_container.setLayout(leftp)
+        main.addWidget(l_container,2)
+
+        center_v= QVBoxLayout()
+        self.token_flow= TokenFlowArea()
+        center_v.addWidget(QLabel("Expression Tokens:"))
+        center_v.addWidget(self.token_flow,1)
+
+        self.syntax_label= QLabel("Syntax OK or not?")
+        center_v.addWidget(self.syntax_label)
+
+        form= QFormLayout()
+        self.alias_edit= QLineEdit()
+        form.addRow("Alias (optional):", self.alias_edit)
+        center_v.addLayout(form)
+
+        dbb= QDialogButtonBox(QDialogButtonBox.Ok| QDialogButtonBox.Cancel)
+        center_v.addWidget(dbb)
+        c_container= QWidget()
+        c_container.setLayout(center_v)
+        main.addWidget(c_container,3)
+
+        self.col_list.itemDoubleClicked.connect(self.on_col_dbl)
+        self.op_list.itemDoubleClicked.connect(self.on_op_dbl)
+
+        dbb.accepted.connect(self.on_ok)
+        dbb.rejected.connect(self.reject)
+
+    def on_col_dbl(self, item):
+        self.token_flow.add_token(item.text())
+        self.check_syntax()
+
+    def on_op_dbl(self, item):
+        txt= item.text()
+        if txt== "CASE (Wizard)":
+            cw= CaseWizardDialog(self.available_columns, self)
+            if cw.exec_()== QDialog.Accepted:
+                cexpr= cw.get_case_expression()
+                self.token_flow.add_token(cexpr)
+        elif txt== "SUBQUERY":
+            sq= SubqueryStubDialog(self)
+            if sq.exec_()== QDialog.Accepted:
+                self.token_flow.add_token(sq.get_subquery())
+        else:
+            self.token_flow.add_token(txt)
+        self.check_syntax()
+
+    def build_expression(self):
+        tokens= self.token_flow.get_tokens()
+        out=[]
+        for t in tokens:
+            if t.endswith("(") or t.startswith(")"):
+                out.append(t)
+            else:
+                out.append(f" {t} ")
+        return "".join(out).strip()
+
+    def check_syntax(self):
+        expr_str= self.build_expression()
+        if not expr_str:
+            self.syntax_label.setText("No expression.")
+            self.syntax_label.setStyleSheet("color: black;")
+            return
+        try:
+            st= sqlparse.parse(expr_str)
+            if not st:
+                raise ValueError("No parse result")
+            self.syntax_label.setText("Expression Syntax: OK")
+            self.syntax_label.setStyleSheet("color: green;")
+        except Exception as ex:
+            self.syntax_label.setText(f"Syntax ERROR => {ex}")
+            self.syntax_label.setStyleSheet("color: red;")
+
+    def on_ok(self):
+        expr= self.build_expression()
+        if not expr:
+            QMessageBox.warning(self,"No Expression","Empty expression.")
+            return
+        self.accept()
+
+    def get_expression_data(self):
+        return (self.alias_edit.text().strip(), self.build_expression())
+
+###############################################################################
+# WindowFunctionWizard
+###############################################################################
+class AdvancedWindowFunctionDialog(QDialog):
+    def __init__(self, available_columns, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Window Function Wizard")
+        self.resize(500,500)
+        self.available_columns= available_columns
+        self.function=""
+        self.main_col=""
+        self.partition_cols=[]
+        self.order_cols=[]
+        self.frame_clause=""
+        self.offset=1
+        self.default_val="0"
+        self.buckets=4
+        self.alias="winfun"
+
+        main= QVBoxLayout(self)
+        frm= QFormLayout()
+
+        self.func_cb= QComboBox()
+        self.func_cb.addItems(["ROW_NUMBER","RANK","DENSE_RANK","NTILE","LAG","LEAD","FIRST_VALUE","LAST_VALUE","SUM","AVG","MIN","MAX"])
+        frm.addRow("Function:", self.func_cb)
+
+        self.col_cb= QComboBox()
+        self.col_cb.addItems(["(No col)"]+self.available_columns)
+        frm.addRow("Main Column:", self.col_cb)
+
+        self.ntile_sb= QSpinBox()
+        self.ntile_sb.setRange(2,999)
+        self.ntile_sb.setValue(4)
+        frm.addRow("NTILE Buckets:", self.ntile_sb)
+
+        self.offset_sb= QSpinBox()
+        self.offset_sb.setRange(1,999)
+        self.offset_sb.setValue(1)
+        frm.addRow("LAG/LEAD Offset:", self.offset_sb)
+
+        self.default_ed= QLineEdit("0")
+        frm.addRow("LAG/LEAD Default:", self.default_ed)
+
+        self.alias_ed= QLineEdit("winfun")
+        frm.addRow("Alias:", self.alias_ed)
+        main.addLayout(frm)
+
+        main.addWidget(QLabel("Partition By (multi-select):"))
+        self.part_list= QListWidget()
+        self.part_list.setSelectionMode(QAbstractItemView.MultiSelection)
+        self.part_list.addItems(self.available_columns)
+        main.addWidget(self.part_list)
+
+        main.addWidget(QLabel("Order By (multi-select):"))
+        self.order_list= QListWidget()
+        self.order_list.setSelectionMode(QAbstractItemView.MultiSelection)
+        self.order_list.addItems(self.available_columns)
+        main.addWidget(self.order_list)
+
+        self.frame_ed= QLineEdit("ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW")
+        main.addWidget(QLabel("Frame Clause (optional):"))
+        main.addWidget(self.frame_ed)
+
+        dbb= QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
+        main.addWidget(dbb)
+        dbb.accepted.connect(self.on_ok)
+        dbb.rejected.connect(self.reject)
+        self.setLayout(main)
+
+    def on_ok(self):
+        fn= self.func_cb.currentText()
+        mc= self.col_cb.currentText()
+        parts= [it.text() for it in self.part_list.selectedItems()]
+        orders=[it.text() for it in self.order_list.selectedItems()]
+        fr= self.frame_ed.text().strip()
+        a= self.alias_ed.text().strip()
+        if not a:
+            QMessageBox.warning(self,"No alias","Need alias.")
+            return
+        self.function= fn
+        if mc!="(No col)":
+            self.main_col= mc
+        self.partition_cols= parts
+        self.order_cols= orders
+        self.frame_clause= fr
+        self.alias= a
+        self.offset= self.offset_sb.value()
+        self.default_val= self.default_ed.text().strip()
+        self.buckets= self.ntile_sb.value()
+        self.accept()
+
+    def get_expression(self):
+        parts=[]
+        if self.partition_cols:
+            parts.append("PARTITION BY "+", ".join(self.partition_cols))
+        if self.order_cols:
+            parts.append("ORDER BY "+", ".join(self.order_cols))
+        if self.frame_clause:
+            parts.append(self.frame_clause)
+        inside="()"
+        if parts:
+            inside="("+ " ".join(parts) +")"
+
+        fn= self.function.upper()
+        col= self.main_col if self.main_col else "0"
+        if fn in ["ROW_NUMBER","RANK","DENSE_RANK"]:
+            return f"{fn}() OVER {inside} AS {self.alias}"
+        elif fn=="NTILE":
+            return f"NTILE({self.buckets}) OVER {inside} AS {self.alias}"
+        elif fn in ["LAG","LEAD"]:
+            return f"{fn}({col}, {self.offset}, {self.default_val}) OVER {inside} AS {self.alias}"
+        elif fn in ["FIRST_VALUE","LAST_VALUE","SUM","AVG","MIN","MAX"]:
+            return f"{fn}({col}) OVER {inside} AS {self.alias}"
+        else:
+            return f"ROW_NUMBER() OVER {inside} AS {self.alias}"
+
+###############################################################################
+# DataProfiler
+###############################################################################
+class ProfilerChartCanvas(FigureCanvasQTAgg):
+    def __init__(self, data_list, col_name="", parent=None):
+        fig= Figure()
+        super().__init__(fig)
+        self.setParent(parent)
+        self.axes= fig.add_subplot(111)
+        self.data= data_list
+        self.col_name= col_name
+        self.plot_data()
+
+    def plot_data(self):
+        self.axes.clear()
+        if not self.data:
+            self.axes.text(0.5,0.5,"No numeric data",ha='center',va='center')
+            self.draw()
+            return
+        self.axes.boxplot(self.data,labels=[self.col_name])
+        self.axes.set_title(f"Outlier Chart: {self.col_name}")
+        self.draw()
+
+class DataProfilerDialog(QDialog):
+    def __init__(self, table_key, columns, connection, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Data Profiler - {table_key}")
+        self.resize(900,500)
+        self.table_key= table_key
+        self.columns= columns
+        self.connection= connection
+
+        main= QVBoxLayout(self)
+        info= QLabel(
+            f"Profiling {table_key} => COUNT(*), DISTINCT, MIN, MAX, AVG => 'ERR' if fails.\n"
+            "Use 'Outlier Chart' for numeric data."
+        )
+        main.addWidget(info)
+
+        self.prof_table= QTableWidget(0,7)
+        self.prof_table.setHorizontalHeaderLabels(["Column","COUNT","DISTINCT","MIN","MAX","AVG","Error"])
+        main.addWidget(self.prof_table)
+
+        row= QHBoxLayout()
+        chart_b= QPushButton("Outlier Chart")
+        chart_b.clicked.connect(self.show_outlier)
+        close_b= QPushButton("Close")
+        close_b.clicked.connect(self.accept)
+        row.addWidget(chart_b)
+        row.addStretch()
+        row.addWidget(close_b)
+        main.addLayout(row)
+        self.setLayout(main)
+
+        self.run_profiler()
+
+    def run_profiler(self):
+        if not self.connection:
+            QMessageBox.warning(self,"No Connection","No DB connection for profiling.")
+            return
+        c= self.connection.cursor()
+        self.prof_table.setRowCount(0)
+
+        for col in self.columns:
+            short_col= col.split(".")[-1]
+            r= self.prof_table.rowCount()
+            self.prof_table.insertRow(r)
+            self.prof_table.setItem(r,0,QTableWidgetItem(short_col))
+
+            # COUNT(*)
+            co_val=""
+            try:
+                c.execute(f"SELECT COUNT(*) FROM {self.table_key}")
+                rr=c.fetchone()
+                co_val=str(rr[0]) if rr else "0"
+            except Exception as ex:
+                co_val=f"ERR({ex})"
+            self.prof_table.setItem(r,1,QTableWidgetItem(co_val))
+
+            # DISTINCT
+            dist_val=""
+            try:
+                c.execute(f"SELECT COUNT(DISTINCT {short_col}) FROM {self.table_key}")
+                rr=c.fetchone()
+                dist_val=str(rr[0]) if rr else "0"
+            except Exception as ex:
+                dist_val=f"ERR({ex})"
+            self.prof_table.setItem(r,2,QTableWidgetItem(dist_val))
+
+            minv,maxv,avgv="N/A","N/A","N/A"
+            err_msg=""
+            try:
+                c.execute(f"SELECT MIN({short_col}) FROM {self.table_key}")
+                rres= c.fetchone()
+                if rres and rres[0]!=None:
+                    minv= str(rres[0])
+                else:
+                    minv="NULL"
+            except Exception as ex:
+                minv="ERR"
+                err_msg= str(ex)
+            try:
+                c.execute(f"SELECT MAX({short_col}) FROM {self.table_key}")
+                rres= c.fetchone()
+                if rres and rres[0]!=None:
+                    maxv= str(rres[0])
+                else:
+                    maxv="NULL"
+            except Exception as ex:
+                maxv="ERR"
+                if not err_msg:
+                    err_msg=str(ex)
+            try:
+                c.execute(f"SELECT AVG({short_col}) FROM {self.table_key}")
+                rres= c.fetchone()
+                if rres and rres[0]!=None:
+                    avgv= str(rres[0])
+                else:
+                    avgv="NULL"
+            except Exception as ex:
+                avgv="ERR"
+                if not err_msg:
+                    err_msg=str(ex)
+
+            self.prof_table.setItem(r,3,QTableWidgetItem(minv))
+            self.prof_table.setItem(r,4,QTableWidgetItem(maxv))
+            self.prof_table.setItem(r,5,QTableWidgetItem(avgv))
+            self.prof_table.setItem(r,6,QTableWidgetItem(err_msg))
+
+    def show_outlier(self):
+        rows= self.prof_table.selectionModel().selectedRows()
+        if not rows:
+            QMessageBox.information(self,"No selection","Pick row first.")
+            return
+        row_idx= rows[0].row()
+        cName= self.prof_table.item(row_idx,0).text()
+
+        data_list=[]
+        try:
+            c= self.connection.cursor()
+            sql= f"SELECT {cName} FROM {self.table_key} WHERE {cName} IS NOT NULL"
+            c.execute(sql)
+            rr= c.fetchall()
+            for r_ in rr:
+                val= r_[0]
+                data_list.append(float(val))
+        except Exception as ex:
+            QMessageBox.warning(self,"Outlier Error",f"Cannot fetch numeric data:\n{ex}")
+            return
+
+        if not data_list:
+            QMessageBox.information(self,"No data","No numeric data or table empty.")
+            return
+
+        d= QDialog(self)
+        d.setWindowTitle(f"Outlier Chart: {cName}")
+        d.resize(600,400)
+        ly= QVBoxLayout(d)
+        can= ProfilerChartCanvas(data_list,cName,d)
+        ly.addWidget(can)
+        dbb= QDialogButtonBox(QDialogButtonBox.Ok)
+        ly.addWidget(dbb)
+        dbb.accepted.connect(d.accept)
+        d.setLayout(ly)
+        d.exec_()
+
+###############################################################################
+# SQLImportTab => parse with sqlglot => partial BFS
+###############################################################################
+class SQLImportTab(QWidget):
+    def __init__(self,builder=None, parent=None):
+        super().__init__(parent)
+        self.builder= builder
+        main= QVBoxLayout(self)
+        instruct= QLabel("Paste or type SQL, then 'Import & Rebuild' via sqlglot.\n"
+                         "Complex queries may only partially import BFS.")
+        main.addWidget(instruct)
+
+        self.sql_edit= QTextEdit()
+        main.addWidget(self.sql_edit)
+
+        row= QHBoxLayout()
+        self.import_btn= QPushButton("Import & Rebuild")
+        row.addWidget(self.import_btn)
+        main.addLayout(row)
+
+        self.import_btn.clicked.connect(self.on_import)
+        self.setLayout(main)
+
+    def on_import(self):
+        raw= self.sql_edit.toPlainText().strip()
+        if not raw:
+            QMessageBox.information(self,"Empty SQL","No SQL to parse.")
+            return
+        try:
+            st= sqlparse.parse(raw)
+            if not st:
+                QMessageBox.warning(self,"No valid SQL","No statements found.")
+                return
+        except Exception as ex:
+            QMessageBox.warning(self,"SyntaxError",f"sqlparse:\n{ex}")
+            return
+
+        try:
+            expr= sqlglot.parse_one(raw)
+        except Exception as ex:
+            QMessageBox.warning(self,"sqlglot parse error", f"Could not parse:\n{ex}")
+            return
+
+        self.builder.import_and_rebuild_canvas(expr,raw)
+        QMessageBox.information(self,"Import OK","Canvas has been rebuilt from the SQL.")
+
+
+###############################################################################
+# CTE => BFS
+###############################################################################
+class CTEDialog(QDialog):
+    def __init__(self, builder_ref, existing_name="", existing_sql="", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Define CTE")
+        self.resize(900,600)
+        self.builder= builder_ref
+        self.cte_name= existing_name
+        self.cte_sql= existing_sql
+
+        main= QVBoxLayout(self)
+        frm= QFormLayout()
+        self.name_edit= QLineEdit(self.cte_name)
+        frm.addRow("CTE Name:", self.name_edit)
+        main.addLayout(frm)
+
+        self.cte_edit= QTextEdit()
+        self.cte_edit.setPlainText(self.cte_sql)
+        main.addWidget(self.cte_edit)
+
+        dbb= QDialogButtonBox(QDialogButtonBox.Ok| QDialogButtonBox.Cancel)
+        main.addWidget(dbb)
+        dbb.accepted.connect(self.on_ok)
+        dbb.rejected.connect(self.reject)
+        self.setLayout(main)
+
+    def on_ok(self):
+        nm= self.name_edit.text().strip()
+        if not nm:
+            QMessageBox.warning(self,"No name","CTE name empty.")
+            return
+        sq= self.cte_edit.toPlainText().strip()
+        if not sq:
+            QMessageBox.warning(self,"No subquery","CTE SQL empty.")
+            return
+        self.cte_name= nm
+        self.cte_sql= sq
+        self.accept()
+
+    def get_cte_data(self):
+        return (self.cte_name, self.cte_sql)
+
+class CTEPanel(QGroupBox):
+    def __init__(self,builder, parent=None):
+        super().__init__("CTEs", parent)
+        self.builder= builder
+        self.cte_data=[]
+        main= QVBoxLayout(self)
+        self.setLayout(main)
+
+        self.cte_table= QTableWidget(0,3)
+        self.cte_table.setHorizontalHeaderLabels(["CTE Name","(Placeholder)","Preview SQL"])
+        self.cte_table.horizontalHeader().setSectionResizeMode(0,QHeaderView.ResizeToContents)
+        self.cte_table.horizontalHeader().setSectionResizeMode(1,QHeaderView.ResizeToContents)
+        self.cte_table.horizontalHeader().setSectionResizeMode(2,QHeaderView.Stretch)
+        self.cte_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.cte_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        main.addWidget(self.cte_table)
+
+        row= QHBoxLayout()
+        add_b= QPushButton("Add CTE")
+        edit_b= QPushButton("Edit CTE")
+        rm_b= QPushButton("Remove CTE")
+        row.addWidget(add_b)
+        row.addWidget(edit_b)
+        row.addWidget(rm_b)
+        row.addStretch()
+        main.addLayout(row)
+
+        add_b.clicked.connect(self.on_add)
+        edit_b.clicked.connect(self.on_edit)
+        rm_b.clicked.connect(self.on_remove)
+
+    def on_add(self):
+        dlg= CTEDialog(self.builder,"","",self)
+        if dlg.exec_()== QDialog.Accepted:
+            n,sql= dlg.get_cte_data()
+            self._add_cte_row(n,sql)
+            # BFS => we show as virtual table
+            self.builder.show_cte_as_virtual_table(n,["col1","col2"])
+            if self.builder.auto_generate:
+                self.builder.generate_sql()
+
+    def on_edit(self):
+        rows= self.cte_table.selectionModel().selectedRows()
+        if not rows:
+            QMessageBox.information(self,"No row","Select a row.")
+            return
+        row_idx= rows[0].row()
+        cName= self.cte_table.item(row_idx,0).text()
+        cSQL= self.cte_table.item(row_idx,2).text()
+
+        dlg= CTEDialog(self.builder,cName,cSQL,self)
+        if dlg.exec_()== QDialog.Accepted:
+            newName, newSQL= dlg.get_cte_data()
+            self.cte_table.setItem(row_idx,0,QTableWidgetItem(newName))
+            self.cte_table.setItem(row_idx,2,QTableWidgetItem(newSQL))
+            self.cte_data[row_idx]['name']= newName
+            self.cte_data[row_idx]['sql']= newSQL
+            if newName!= cName:
+                self.builder.remove_virtual_cte_table(cName)
+            self.builder.show_cte_as_virtual_table(newName,["col1","col2"])
+            if self.builder.auto_generate:
+                self.builder.generate_sql()
+
+    def on_remove(self):
+        rows= sorted([r.row() for r in self.cte_table.selectionModel().selectedRows()], reverse=True)
+        for rr in rows:
+            nm= self.cte_table.item(rr,0).text()
+            self.cte_table.removeRow(rr)
+            del self.cte_data[rr]
+            self.builder.remove_virtual_cte_table(nm)
+        if self.builder.auto_generate:
+            self.builder.generate_sql()
+
+    def _add_cte_row(self, n, sql):
+        r= self.cte_table.rowCount()
+        self.cte_table.insertRow(r)
+        self.cte_table.setItem(r,0,QTableWidgetItem(n))
+        self.cte_table.setItem(r,1,QTableWidgetItem("(Edit)"))
+        self.cte_table.setItem(r,2,QTableWidgetItem(sql))
+        self.cte_data.append({'name':n,'sql':sql})
+
+    def get_ctes(self):
+        out=[]
+        for r in range(self.cte_table.rowCount()):
+            nm= self.cte_table.item(r,0).text()
+            s= self.cte_table.item(r,2).text()
+            out.append((nm,s))
+        return out
+
+###############################################################################
+# Simple result data dialog
 ###############################################################################
 class ResultDataDialog(QDialog):
     def __init__(self, rows, columns, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("SQL Results (Sample Rows)")
-        self.resize(700,400)
-        main=QVBoxLayout(self)
-        tbl=QTableWidget(len(rows), len(columns))
+        self.setWindowTitle("SQL Results")
+        self.resize(800,400)
+        main= QVBoxLayout(self)
+        tbl= QTableWidget(len(rows), len(columns))
         tbl.setHorizontalHeaderLabels(columns)
-        for r_idx, row_val in enumerate(rows):
-            for c_idx,val in enumerate(row_val):
-                it=QTableWidgetItem(str(val))
-                tbl.setItem(r_idx,c_idx,it)
+        for rr, rowval in enumerate(rows):
+            for cc, val in enumerate(rowval):
+                it= QTableWidgetItem(str(val))
+                tbl.setItem(rr,cc,it)
         main.addWidget(tbl)
-        btns=QDialogButtonBox(QDialogButtonBox.Ok)
-        btns.accepted.connect(self.accept)
-        main.addWidget(btns)
+        dbb= QDialogButtonBox(QDialogButtonBox.Ok)
+        dbb.accepted.connect(self.accept)
+        main.addWidget(dbb)
         self.setLayout(main)
 
 ###############################################################################
-# 15) The main VisualQueryBuilderTab
+# Sub VQB => combine queries
+###############################################################################
+class SubVQBDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Combine Query (Sub VQB)")
+        self.resize(900,600)
+        self.operator="UNION"
+        self.second_sql=""
+
+        lay= QVBoxLayout(self)
+        row= QHBoxLayout()
+        row.addWidget(QLabel("Combine Operator:"))
+        self.op_combo= QComboBox()
+        self.op_combo.addItems(["UNION","UNION ALL","INTERSECT","EXCEPT"])
+        row.addWidget(self.op_combo)
+        row.addStretch()
+        lay.addLayout(row)
+
+        self.sub_edit= QTextEdit()
+        lay.addWidget(self.sub_edit)
+
+        dbb= QDialogButtonBox(QDialogButtonBox.Ok| QDialogButtonBox.Cancel)
+        lay.addWidget(dbb)
+        dbb.accepted.connect(self.on_ok)
+        dbb.rejected.connect(self.reject)
+        self.setLayout(lay)
+
+    def on_ok(self):
+        op= self.op_combo.currentText()
+        sq= self.sub_edit.toPlainText().strip()
+        if not sq:
+            QMessageBox.warning(self,"No Query","No sub query typed.")
+            return
+        self.operator= op
+        self.second_sql= sq
+        self.accept()
+
+    def getResult(self):
+        return (self.operator, self.second_sql)
+
+###############################################################################
+# The main VQB Tab
 ###############################################################################
 class VisualQueryBuilderTab(QWidget):
-    def __init__(self,parent=None):
+    def __init__(self, multi_connections=None, linked_map=None, parent=None):
         super().__init__(parent)
-        self.connections={}
-        self.fk_map={}
+        self.connections= multi_connections if multi_connections else {}
+        self.linked_server_map= linked_map if linked_map else {}
+        self.auto_generate= True
+        self.operation_mode= "SELECT"
+
         self.table_columns_map={}
-        self.auto_generate=True
-        self.operation_mode="SELECT"
-        self.threadpool=QThreadPool.globalInstance()
 
         self.init_ui()
+        self.threadpool= QThreadPool.globalInstance()
 
     def init_ui(self):
-        main=QVBoxLayout(self)
+        main= QVBoxLayout(self)
 
-        # connection row
-        conn_h=QHBoxLayout()
-        self.status_light=QFrame()
+        row1= QHBoxLayout()
+        self.status_light= QFrame()
         self.status_light.setFixedSize(15,15)
-        self.status_light.setStyleSheet("QFrame { border-radius:7px; background-color: red;}")
-        self.server_label=QLabel("Not Connected")
-        conn_btn=QPushButton("Connect")
-        conn_btn.clicked.connect(self.open_connect_dialog)
-        conn_h.addWidget(self.status_light)
-        conn_h.addWidget(self.server_label)
-        conn_h.addWidget(conn_btn)
+        self.status_light.setStyleSheet("QFrame { border-radius:7px; background-color:red;}")
+        self.conn_label= QLabel("Not Connected")
+        row1.addWidget(self.status_light)
+        row1.addWidget(self.conn_label)
 
-        self.auto_chk=QCheckBox("Auto-Generate")
+        self.auto_chk= QCheckBox("Auto-Generate")
         self.auto_chk.setChecked(True)
-        self.auto_chk.stateChanged.connect(self.on_auto_gen_changed)
-        conn_h.addWidget(self.auto_chk)
+        self.auto_chk.stateChanged.connect(lambda s: setattr(self,"auto_generate",(s== Qt.Checked)))
+        row1.addWidget(self.auto_chk)
+        row1.addStretch()
+        main.addLayout(row1)
 
-        conn_h.addStretch()
-        main.addLayout(conn_h)
-
-        # toolbar
-        tb_h=QHBoxLayout()
-        ref_btn=QPushButton("Refresh Schema")
-        ref_btn.clicked.connect(self.refresh_schema)
-        tb_h.addWidget(ref_btn)
-
-        subq_btn=QPushButton("Add SubQuery to Canvas")
-        subq_btn.clicked.connect(self.add_subquery_to_canvas)
-        tb_h.addWidget(subq_btn)
-
-        expr_btn=QPushButton("Expression Builder")
-        expr_btn.clicked.connect(self.launch_expr_builder)
-        tb_h.addWidget(expr_btn)
-
-        win_btn=QPushButton("Window Function Wizard")
-        win_btn.clicked.connect(self.launch_window_func)
-        tb_h.addWidget(win_btn)
-
-        comb_btn=QPushButton("Combine Query (Full Sub VQB)")
-        comb_btn.clicked.connect(self.combine_with_subvqb)
-        tb_h.addWidget(comb_btn)
-
-        self.op_combo=QComboBox()
+        row2= QHBoxLayout()
+        subq_b= QPushButton("Add SubQuery to Canvas")
+        expr_b= QPushButton("Expression Builder")
+        wfun_b= QPushButton("Window Function Wizard")
+        comb_b= QPushButton("Combine Query (Sub VQB)")
+        self.op_combo= QComboBox()
         self.op_combo.addItems(["SELECT","INSERT","UPDATE","DELETE"])
-        self.op_combo.currentIndexChanged.connect(self.on_op_mode_changed)
-        tb_h.addWidget(self.op_combo)
+        row2.addWidget(subq_b)
+        row2.addWidget(expr_b)
+        row2.addWidget(wfun_b)
+        row2.addWidget(comb_b)
+        row2.addWidget(self.op_combo)
+        row2.addStretch()
+        main.addLayout(row2)
 
-        tb_h.addStretch()
-        main.addLayout(tb_h)
+        subq_b.clicked.connect(self.add_subquery_item)
+        expr_b.clicked.connect(self.launch_expr_builder)
+        wfun_b.clicked.connect(self.launch_window_func)
+        comb_b.clicked.connect(self.combine_with_subvqb)
+        self.op_combo.currentIndexChanged.connect(self.on_op_changed)
 
-        self.tabs=QTabWidget()
+        self.tabs= QTabWidget()
         main.addWidget(self.tabs)
 
-        self.schema_tab=QWidget()
-        self.config_tab=QWidget()
-        self.sql_tab=QWidget()
-        self.import_tab=SQLImportTab(builder=self)
+        self.schema_tab= QWidget()
+        self.config_tab= QWidget()
+        self.sql_tab= QWidget()
+        self.import_tab= SQLImportTab(builder=self)
 
         self.tabs.addTab(self.schema_tab,"Schema & Canvas")
         self.tabs.addTab(self.config_tab,"Query Config")
         self.tabs.addTab(self.sql_tab,"SQL Preview")
         self.tabs.addTab(self.import_tab,"SQL Import")
 
-        self.status_bar=QStatusBar()
+        self.status_bar= QStatusBar()
         main.addWidget(self.status_bar)
         self.setLayout(main)
 
@@ -1667,351 +2358,367 @@ class VisualQueryBuilderTab(QWidget):
         self.setup_config_tab()
         self.setup_sql_tab()
 
-    def set_connections(self, conns):
-        self.connections=conns
-        if conns:
-            first_key=list(conns.keys())[0]
-            self.load_schema(first_key)
-
-    def open_connect_dialog(self):
-        d=ODBCConnectDialog(self)
-        if d.exec_()==QDialog.Accepted:
-            c=d.get_connection()
-            db_type=d.get_db_type()
-            if c and db_type and db_type.upper()=="TERADATA":
-                alias=f"{db_type}_{len(self.connections)+1}"
-                self.connections[alias]={"connection":c}
-                self.update_conn_status(True,f"{db_type} ({alias})")
-                self.load_schema(alias)
-                self.fk_map=load_foreign_keys(c)
-            else:
-                QMessageBox.warning(self,"Only Teradata","DSN restricted to Teradata")
-
-    def update_conn_status(self, st, info=""):
-        if st:
-            self.status_light.setStyleSheet("QFrame { border-radius:7px; background-color: green;}")
-            self.server_label.setText(info)
-        else:
-            self.status_light.setStyleSheet("QFrame { border-radius:7px; background-color: red;}")
-            self.server_label.setText("Not Connected")
-
-    def load_schema(self, alias):
-        if alias not in self.connections:
-            return
-        conn=self.connections[alias]["connection"]
-        self.schema_tree.connection=conn
-        self.schema_tree.populate_top_level()
-        self.status_bar.showMessage(f"Schema loaded => {alias}",3000)
-
-    def refresh_schema(self):
-        if not self.connections:
-            QMessageBox.information(self,"No Connection","Please connect first.")
-            return
-        first_key=list(self.connections.keys())[0]
-        self.load_schema(first_key)
-
     def setup_schema_tab(self):
-        lay=QVBoxLayout(self.schema_tab)
-        self.search_ed=QLineEdit()
-        self.search_ed.setPlaceholderText("Search tables/columns...")
-        self.search_ed.textChanged.connect(self.on_schema_filter)
+        lay= QVBoxLayout(self.schema_tab)
+        self.search_ed= QLineEdit()
+        self.search_ed.setPlaceholderText("Filter schema tree...")
+        self.search_ed.textChanged.connect(self.filter_schema)
         lay.addWidget(self.search_ed)
 
-        splitter=QSplitter(Qt.Horizontal)
-        self.schema_tree=LazySchemaTreeWidget(None,parent_builder=self)
-        leftp=QWidget()
-        lp=QVBoxLayout(leftp)
-        lp.addWidget(self.schema_tree)
+        splitter= QSplitter(Qt.Horizontal)
+        self.schema_tree= MultiDBLazySchemaTreeWidget(self.connections, parent_builder=self)
+        leftp= QWidget()
+        lyp= QVBoxLayout(leftp)
+        lyp.addWidget(self.schema_tree)
         splitter.addWidget(leftp)
 
-        self.canvas=EnhancedCanvasGraphicsView(self)
+        self.canvas= EnhancedCanvasGraphicsView(self)
         splitter.addWidget(self.canvas)
         splitter.setStretchFactor(0,1)
         splitter.setStretchFactor(1,3)
         lay.addWidget(splitter)
 
-        self.progress=QProgressBar()
+        self.progress= QProgressBar()
         self.progress.setVisible(False)
         lay.addWidget(self.progress)
 
     def setup_config_tab(self):
-        h=QHBoxLayout(self.config_tab)
-        self.filter_panel=FilterPanel(self)
+        h= QHBoxLayout(self.config_tab)
+        self.cte_panel= CTEPanel(self)
+        h.addWidget(self.cte_panel,2)
+
+        self.filter_panel= FilterPanel(self)
         h.addWidget(self.filter_panel,2)
-        self.group_panel=GroupByPanel(self)
-        h.addWidget(self.group_panel,3)
-        self.sort_panel=SortLimitPanel(self)
+
+        col= QVBoxLayout()
+        self.group_panel= GroupByPanel(self)
+        self.agg_panel= GroupAggPanel(self)
+        col.addWidget(self.group_panel)
+        col.addWidget(self.agg_panel)
+        midw= QWidget()
+        midw.setLayout(col)
+        h.addWidget(midw,3)
+
+        self.sort_panel= SortLimitPanel(self)
         h.addWidget(self.sort_panel,2)
         self.config_tab.setLayout(h)
 
     def setup_sql_tab(self):
-        lay=QVBoxLayout(self.sql_tab)
-        top_h=QHBoxLayout()
-        top_h.addWidget(QLabel("Generated SQL:"))
-        run_btn=QPushButton("Run SQL")
-        run_btn.clicked.connect(self.run_sql)
-        top_h.addWidget(run_btn,alignment=Qt.AlignRight)
-        lay.addLayout(top_h)
+        lay= QVBoxLayout(self.sql_tab)
+        top= QHBoxLayout()
+        top.addWidget(QLabel("Generated SQL:"))
+        run_b= QPushButton("Run SQL")
+        run_b.clicked.connect(self.run_sql)
+        top.addWidget(run_b, alignment=Qt.AlignRight)
+        lay.addLayout(top)
 
-        self.sql_display=QTextEdit()
-        self.sql_display.setReadOnly(False)
-        self.sql_highlighter=SQLHighlighter(self.sql_display.document())
-        lay.addWidget(self.sql_display)
+        self.sql_edit= QTextEdit()
+        self.sql_edit.setReadOnly(False)
+        self.sql_highlighter= SQLHighlighter(self.sql_edit.document())
+        lay.addWidget(self.sql_edit)
 
-        self.validation_lbl=QLabel("SQL Status: Unknown")
+        self.validation_lbl= QLabel("SQL Status: Unknown")
         lay.addWidget(self.validation_lbl)
+
+        prof_b= QPushButton("Data Profiler")
+        prof_b.clicked.connect(self.launch_data_profiler)
+        lay.addWidget(prof_b, alignment=Qt.AlignRight)
+
         self.sql_tab.setLayout(lay)
 
-    def run_sql(self):
-        sql=self.sql_display.toPlainText().strip()
-        if not sql:
-            QMessageBox.information(self,"Empty SQL","No SQL to run.")
-            return
-        if not self.connections:
-            QMessageBox.information(self,"No Conn","No DB connection found.")
-            return
-        first_key=list(self.connections.keys())[0]
-        conn=self.connections[first_key]["connection"]
-        try:
-            c=conn.cursor()
-            if "limit" not in sql.lower():
-                sql+="\nLIMIT 10"
-            c.execute(sql)
-            rows=c.fetchall()
-            cols=[desc[0] for desc in c.description]
-            rd=ResultDataDialog(rows,cols,self)
-            rd.exec_()
-        except Exception as ex:
-            QMessageBox.warning(self,"SQL Error",f"Failed:\n{ex}")
+    def set_connections(self, conns):
+        self.connections= conns
+        if conns:
+            self.update_conn_status(True, f"{len(conns)} DSNs connected.")
+        else:
+            self.update_conn_status(False,"No Connections")
+        self.schema_tree.connections= conns
+        self.schema_tree.populate_roots()
 
-    def on_schema_filter(self, txt):
-        for i in range(self.schema_tree.topLevelItemCount()):
-            it=self.schema_tree.topLevelItem(i)
-            self._filter_item(it,txt)
+    def set_federation_map(self, newmap):
+        self.linked_server_map= newmap
 
-    def _filter_item(self, it, txt):
-        low=txt.lower()
-        match=low in it.text(0).lower()
-        child_match=False
-        for c in range(it.childCount()):
-            child_match=self._filter_item(it.child(c),txt) or child_match
-        it.setHidden(not (match or child_match))
-        return match or child_match
+    def update_conn_status(self, st, txt):
+        if st:
+            self.status_light.setStyleSheet("QFrame { border-radius:7px; background-color: green;}")
+            self.conn_label.setText(txt)
+        else:
+            self.status_light.setStyleSheet("QFrame { border-radius:7px; background-color: red;}")
+            self.conn_label.setText("Not Connected")
 
-    def on_auto_gen_changed(self, st):
-        self.auto_generate=(st==Qt.Checked)
+    def filter_schema(self, val):
+        # naive filter
+        def do_f(i, text):
+            show= False
+            if text.lower() in i.text(0).lower():
+                show= True
+            for ch in range(i.childCount()):
+                if do_f(i.child(ch), text):
+                    show= True
+            i.setHidden(not show)
+            return show
 
-    def on_op_mode_changed(self, idx):
-        modes=["SELECT","INSERT","UPDATE","DELETE"]
-        self.operation_mode=modes[idx]
-        self.toggle_dml_canvas()
+        for r in range(self.schema_tree.topLevelItemCount()):
+            topi= self.schema_tree.topLevelItem(r)
+            do_f(topi,val)
+
+    def add_subquery_item(self):
+        # BFS => nested subquery item
+        from_ = self.canvas.mapToScene(300,200)
+        # We'll just place it at (300,200).
+        # Or we can do something else
+        x= from_.x()
+        y= from_.y()
+        it= NestedSubqueryItem(self, x,y)
+        self.canvas.scene_.addItem(it)
+        key= f"SubQueryItem_{id(it)}"
+        self.canvas.table_items[key]= it
         if self.auto_generate:
             self.generate_sql()
-
-    def add_subquery_to_canvas(self):
-        self.canvas.add_subquery_item(200,200)
-        if self.auto_generate:
-            self.generate_sql()
-
-    def combine_with_subvqb(self):
-        d=SubVQBDialog(parent_vqb=self,parent=self)
-        if d.exec_()==QDialog.Accepted:
-            op,second_sql=d.getResult()
-            old=self.sql_display.toPlainText().strip()
-            if old:
-                new_sql=old+f"\n{op}\n(\n{second_sql}\n)"
-            else:
-                new_sql=f"{op}\n(\n{second_sql}\n)"
-            self.sql_display.setPlainText(new_sql)
-            self.validate_sql()
 
     def launch_expr_builder(self):
-        cols=self.get_all_possible_columns_for_dialog()
-        dlg=AdvancedExpressionBuilderDialog(cols,self)
-        if dlg.exec_()==QDialog.Accepted:
-            a,exp=dlg.get_expression_data()
-            old=self.sql_display.toPlainText()
-            self.sql_display.setPlainText(old+f"\n-- Derived: {a}=\n{exp}")
+        # advanced token-based expr builder
+        cols= self.get_all_possible_columns_for_dialog()
+        dlg= AdvancedExpressionBuilderDialog(cols,self)
+        if dlg.exec_()== QDialog.Accepted:
+            al, expr= dlg.get_expression_data()
+            old= self.sql_edit.toPlainText()
+            if al:
+                newp= f"({expr}) AS {al}"
+            else:
+                newp= expr
+            self.sql_edit.setPlainText(old+ "\n-- Derived expression:\n"+ newp)
             self.validate_sql()
 
     def launch_window_func(self):
-        QMessageBox.information(self,"Window Function Wizard","Implement advanced wizard or use expression builder if needed.")
+        c= self.get_all_possible_columns_for_dialog()
+        dlg= AdvancedWindowFunctionDialog(c,self)
+        if dlg.exec_()== QDialog.Accepted:
+            e= dlg.get_expression()
+            old= self.sql_edit.toPlainText()
+            self.sql_edit.setPlainText(old+ f"\n-- WindowFunc:\n{e}")
+            self.validate_sql()
 
-    def handle_drop(self, full_name, pos):
-        if not self.connections:
-            if full_name not in self.table_columns_map:
-                self.table_columns_map[full_name]=["id","col1","col2"]
-        else:
-            if '.' in full_name:
-                dbN,tblN=full_name.split('.',1)
-                first_key=list(self.connections.keys())[0]
-                conn=self.connections[first_key]["connection"]
-                realCols=load_columns_for_table(conn,dbN,tblN)
-                if not realCols:
-                    realCols=["id","col1","col2"]
-                self.table_columns_map[full_name]=realCols
+    def combine_with_subvqb(self):
+        d= SubVQBDialog(self)
+        if d.exec_()== QDialog.Accepted:
+            op, ssql= d.getResult()
+            old= self.sql_edit.toPlainText().strip()
+            if old:
+                self.sql_edit.setPlainText(old+f"\n{op}\n(\n{ssql}\n)")
             else:
-                self.table_columns_map[full_name]=["id","col1","col2"]
+                self.sql_edit.setPlainText(f"{op}\n(\n{ssql}\n)")
+            self.validate_sql()
 
-        cols=self.table_columns_map[full_name]
-        self.canvas.add_table_item(full_name, cols, pos.x(), pos.y())
-        self.check_auto_fk(full_name)
+    def on_op_changed(self, idx):
+        modes=["SELECT","INSERT","UPDATE","DELETE"]
+        self.operation_mode= modes[idx]
+        if self.auto_generate:
+            self.generate_sql()
 
-    def handle_remove_table(self, table_item):
-        for k,v in list(self.canvas.table_items.items()):
-            if v==table_item:
-                self.canvas.remove_table_item(k)
-                break
-
-    def check_auto_fk(self, table_key):
-        if not self.fk_map:
+    def run_sql(self):
+        raw= self.sql_edit.toPlainText().strip()
+        if not raw:
+            QMessageBox.information(self,"Empty SQL","No SQL to run.")
             return
-        item=self.canvas.table_items.get(table_key,None)
-        if not item:
+        if not self.connections:
+            QMessageBox.information(self,"No Connections","No DB connection.")
             return
+        first_alias= list(self.connections.keys())[0]
+        conn= self.connections[first_alias]["connection"]
+        if not conn:
+            QMessageBox.warning(self,"No conn","Invalid connection.")
+            return
+        try:
+            c= conn.cursor()
+            c.execute(raw)
+            rows= c.fetchall()
+            cols= [d[0] for d in c.description] if c.description else []
+            rd= ResultDataDialog(rows, cols, self)
+            rd.exec_()
+        except Exception as ex:
+            QMessageBox.warning(self,"SQL Error",f"{ex}")
+
+    def launch_data_profiler(self):
+        # pick BFS table item => real table => data profiler
+        real_tables=[]
+        for k,v in self.canvas.table_items.items():
+            if hasattr(v,"columns") and not k.startswith("SubQueryItem_") and not k.startswith("CTE."):
+                real_tables.append(k)
+        if not real_tables:
+            QMessageBox.information(self,"No Table","No real BFS tables.")
+            return
+        chosen,ok= QtWidgets.QInputDialog.getItem(self,"Pick Table","",real_tables,0,False)
+        if not ok or not chosen:
+            return
+        item= self.canvas.table_items.get(chosen)
         if not hasattr(item,"columns"):
+            QMessageBox.warning(self,"No columns?","BFS item has no columns.")
             return
-        col_list=item.columns
-        for c in col_list:
-            child_key=f"{table_key}.{c}"
-            if child_key in self.fk_map:
-                pk=self.fk_map[child_key]
-                parent_tab=".".join(pk.split('.')[:2])
-                pitem=self.canvas.table_items.get(parent_tab,None)
-                if pitem:
-                    jl=JoinLine(item,pitem,"LEFT",f"{child_key}={pk}")
-                    self.canvas.scene_.addItem(jl)
-                    self.canvas.join_lines.append(jl)
-                    jl.update_line()
-        for ck,pk in self.fk_map.items():
-            if pk.startswith(table_key+"."):
-                child_tab=".".join(ck.split('.')[:2])
-                citm=self.canvas.table_items.get(child_tab,None)
-                if citm:
-                    jl=JoinLine(citm,item,"LEFT",f"{ck}={pk}")
-                    self.canvas.scene_.addItem(jl)
-                    self.canvas.join_lines.append(jl)
-                    jl.update_line()
-
-    def get_selected_columns(self):
-        arr=[]
-        for k,itm in self.canvas.table_items.items():
-            if hasattr(itm,"get_selected_columns"):
-                arr.extend(itm.get_selected_columns())
-        return arr
+        alias= chosen.split(".")[0]
+        conn=None
+        if alias in self.connections:
+            conn= self.connections[alias]["connection"]
+        if not conn:
+            QMessageBox.warning(self,"No connection","No DB conn for that alias.")
+            return
+        colkeys=[]
+        for c in item.columns:
+            colkeys.append(f"{chosen}.{c}")
+        d= DataProfilerDialog(chosen,colkeys,conn,self)
+        d.exec_()
 
     def get_all_possible_columns_for_dialog(self):
         arr=[]
-        for k,itm in self.canvas.table_items.items():
-            if hasattr(itm,"columns"):
-                for c in itm.columns:
+        for k,v in self.canvas.table_items.items():
+            if hasattr(v,"columns"):
+                for c in v.columns:
                     arr.append(f"{k}.{c}")
         return arr
 
-    def toggle_dml_canvas(self):
-        if self.operation_mode=="SELECT":
-            if self.canvas.operation_red_line:
-                self.canvas.scene_.removeItem(self.canvas.operation_red_line)
-                self.canvas.operation_red_line=None
-            if self.canvas.complete_query_item:
-                self.canvas.scene_.removeItem(self.canvas.complete_query_item)
-                self.canvas.complete_query_item=None
-            if self.canvas.target_table_item:
-                self.canvas.scene_.removeItem(self.canvas.target_table_item)
-                self.canvas.target_table_item=None
-            self.canvas.remove_mapping_lines()
+    def handle_drop(self, full_name, pos):
+        # parse => alias.db.table
+        # load columns
+        parts= full_name.split(".")
+        if len(parts)<3:
             return
-
-        self.canvas.add_vertical_red_line(450)
-        if not self.canvas.complete_query_item:
-            rect=QGraphicsRectItem(0,0,200,120)
-            rect.setBrush(QBrush(QColor(250,250,180)))
-            rect.setPen(QPen(Qt.red,2))
-            rect.setPos(100,200)
-            rect.setFlags(QGraphicsItem.ItemIsMovable|QGraphicsItem.ItemIsSelectable)
-            lab=QGraphicsTextItem("Complete Query (Source)", rect)
-            lab.setPos(5,5)
-            self.canvas.scene_.addItem(rect)
-            self.canvas.complete_query_item=rect
-
-        if not self.canvas.target_table_item:
-            rect2=QGraphicsRectItem(0,0,200,120)
-            rect2.setBrush(QBrush(QColor(220,220,255)))
-            rect2.setPen(QPen(Qt.darkGray,2))
-            rect2.setPos(500,200)
-            rect2.setFlags(QGraphicsItem.ItemIsMovable|QGraphicsItem.ItemIsSelectable)
-            l2=QGraphicsTextItem("Target: myDB.myTarget", rect2)
-            l2.setPos(5,5)
-            y2=25
-            for cc in ["colA","colB","key"]:
-                t2=QGraphicsTextItem(cc,rect2)
-                t2.setPos(5,y2)
-                y2+=15
-            self.canvas.scene_.addItem(rect2)
-            self.canvas.target_table_item=rect2
-
-    def generate_sql(self):
-        if not self.auto_generate:
-            return
-        if self.operation_mode!="SELECT":
-            self.rebuild_bfs_complex_query_item()
-
-        if self.operation_mode=="INSERT":
-            sql=self._generate_insert()
-        elif self.operation_mode=="UPDATE":
-            sql=self._generate_update()
-        elif self.operation_mode=="DELETE":
-            sql=self._generate_delete()
+        alias, dbn, tbl= parts[0], parts[1], parts[2]
+        info= self.connections.get(alias)
+        if info:
+            c= info["connection"]
+            dbt= info["db_type"]
+            cols= load_columns(c, dbt, dbn, tbl)
+            if not cols:
+                cols=["col1","col2","col3"]
+            self.table_columns_map[full_name]= cols
         else:
-            sql=self._generate_select()
-        self.sql_display.setPlainText(sql)
-        self.validate_sql()
+            # fallback
+            if full_name not in self.table_columns_map:
+                self.table_columns_map[full_name]=["col1","col2"]
 
-    def rebuild_bfs_complex_query_item(self):
-        if not self.canvas.complete_query_item:
-            return
-        old_ch=list(self.canvas.complete_query_item.childItems())
-        for ch in old_ch:
-            if isinstance(ch,QGraphicsTextItem):
-                txt=ch.toPlainText()
-                if not txt.startswith("Complete Query"):
-                    ch.setParentItem(None)
-                    self.canvas.scene_.removeItem(ch)
-
-        bfs_cols=self.get_selected_columns()
-        yOff=25
-        for col in bfs_cols:
-            t=QGraphicsTextItem(col, self.canvas.complete_query_item)
-            t.setPos(5,yOff)
-            yOff+=15
+        col_list= self.table_columns_map[full_name]
+        self.canvas.add_table_item(full_name, col_list, pos.x(), pos.y())
 
     def validate_sql(self):
-        txt=self.sql_display.toPlainText().strip()
+        txt= self.sql_edit.toPlainText().strip()
         if not txt:
             self.validation_lbl.setText("SQL Status: No SQL.")
             self.validation_lbl.setStyleSheet("color:orange;")
             return
         try:
-            parser=FullSQLParser(txt)
-            parser.parse()
+            FullSQLParser(txt).parse()
             self.validation_lbl.setText("SQL Status: Valid.")
             self.validation_lbl.setStyleSheet("color:green;")
         except Exception as ex:
             self.validation_lbl.setText(f"SQL Status: Invalid - {ex}")
             self.validation_lbl.setStyleSheet("color:red;")
 
+    def import_and_rebuild_canvas(self, expr, full_sql):
+        # Clear BFS
+        for k in list(self.canvas.table_items.keys()):
+            self.canvas.remove_table_item(k)
+        self.canvas.remove_mapping_lines()
+
+        # Clear filter
+        while self.filter_panel.where_table.rowCount()>0:
+            self.filter_panel.where_table.removeRow(0)
+        while self.filter_panel.having_table.rowCount()>0:
+            self.filter_panel.having_table.removeRow(0)
+
+        # Clear group
+        while self.group_panel.gb_table.rowCount()>0:
+            self.group_panel.gb_table.removeRow(0)
+        while self.agg_panel.agg_table.rowCount()>0:
+            self.agg_panel.agg_table.removeRow(0)
+
+        # Clear sort
+        while self.sort_panel.sort_table.rowCount()>0:
+            self.sort_panel.sort_table.removeRow(0)
+        self.sort_panel.limit_spin.setValue(0)
+        self.sort_panel.offset_spin.setValue(0)
+
+        # Clear ctes
+        while self.cte_panel.cte_table.rowCount()>0:
+            self.cte_panel.cte_table.removeRow(0)
+        self.cte_panel.cte_data.clear()
+
+        # If expr key= WITH => parse ctes
+        main_expr= expr
+        if expr.key=="WITH":
+            cte_exps= expr.args.get("expressions") or []
+            for cexp in cte_exps:
+                cname= cexp.alias
+                csql= cexp.this.sql()
+                self.cte_panel._add_cte_row(cname, csql)
+            main_expr= expr.this
+
+        # If main_expr not SELECT => just show
+        if not isinstance(main_expr, exp.Select):
+            self.sql_edit.setPlainText(full_sql)
+            self.validate_sql()
+            return
+
+        # simple approach
+        self.sql_edit.setPlainText(full_sql)
+        self.validate_sql()
+
+    def toggle_dml_canvas(self):
+        # we no longer do placeholders. We'll just let user mark BFS items as DML target.
+        pass
+
+    def generate_sql(self):
+        if not self.auto_generate:
+            return
+        if self.operation_mode=="INSERT":
+            body= self._gen_insert()
+        elif self.operation_mode=="UPDATE":
+            body= self._gen_update()
+        elif self.operation_mode=="DELETE":
+            body= self._gen_delete()
+        else:
+            body= self._gen_select()
+
+        ctes= self.cte_panel.get_ctes()
+        if ctes:
+            cparts=[]
+            for n, s in ctes:
+                cparts.append(f"{n} AS (\n{s}\n)")
+            cblock= "WITH "+ ",\n  ".join(cparts)+ "\n"
+            final_sql= cblock + body
+        else:
+            final_sql= body
+        self.sql_edit.setPlainText(final_sql)
+        self.validate_sql()
+
+    def _transform_for_fed(self, table_key):
+        # parse => alias.db.table
+        # if alias in linked_server_map => rewrite
+        parts= table_key.split(".")
+        if len(parts)<3:
+            return table_key
+        alias= parts[0]
+        ls= self.linked_server_map.get(alias)
+        if ls:
+            dbn= parts[1]
+            tbl= parts[2]
+            return f"[{ls}].[{dbn}].dbo.[{tbl}]"
+        return table_key
+
     def _build_bfs_from(self):
-        invert={v:k for k,v in self.canvas.table_items.items()}
+        invert= {v:k for k,v in self.canvas.table_items.items()}
         adj={}
         for k in self.canvas.table_items.keys():
             adj[k]=[]
-        for jl in self.canvas.join_lines:
-            s=invert.get(jl.start_item,None)
-            e=invert.get(jl.end_item,None)
-            if s and e:
-                adj[s].append((e,jl))
-                adj[e].append((s,jl))
-        visited=set()
+        # gather join lines
+        for it in self.canvas.scene_.items():
+            if isinstance(it,JoinLine):
+                s= invert.get(it.start_item)
+                e= invert.get(it.end_item)
+                if s and e:
+                    adj[s].append((e,it))
+                    adj[e].append((s,it))
+
+        visited= set()
         blocks=[]
         for root in adj:
             if root not in visited:
@@ -2019,212 +2726,267 @@ class VisualQueryBuilderTab(QWidget):
                 visited.add(root)
                 seg=[root]
                 while queue:
-                    node=queue.pop(0)
-                    for (nbr,ln) in adj[node]:
+                    nd= queue.pop(0)
+                    for (nbr,ln) in adj[nd]:
                         if nbr not in visited:
                             visited.add(nbr)
                             queue.append(nbr)
-                            seg.append(f"{ln.join_type} {nbr} ON {ln.condition}")
-                block="\n  ".join(seg)
-                if not blocks:
-                    blocks.append("FROM "+block)
-                else:
-                    blocks.append("-- Another subgraph:\nFROM "+block)
-        if not blocks:
-            return "-- no tables on canvas"
-        return "\n".join(blocks)
+                            seg.append(f"{ln.join_type} JOIN {nbr} ON {ln.condition}")
+                block= "\n  ".join(seg)
+                blocks.append("FROM "+block)
 
-    def _generate_select(self):
-        scols=self.get_selected_columns()
+        if not blocks:
+            return "-- no tables"
+        # rewrite for cross-DB
+        final=[]
+        for blk in blocks:
+            lines= blk.split("\n")
+            outblk=[]
+            for line in lines:
+                tokens= line.split()
+                row=[]
+                for t in tokens:
+                    if t.count(".")>=2 and t.upper() not in ["FROM","JOIN","ON","INNER","LEFT","RIGHT","FULL"]:
+                        row.append(self._transform_for_fed(t))
+                    else:
+                        row.append(t)
+                outblk.append(" ".join(row))
+            final.append("\n".join(outblk))
+        return "\n".join(final)
+
+    def _gen_select(self):
+        scols=[]
+        for k,it in self.canvas.table_items.items():
+            if hasattr(it,"get_selected_columns"):
+                scols.extend(it.get_selected_columns())
         if not scols:
             scols=["*"]
-        ags=self.group_panel.get_aggregates()
-        final_cols=list(scols)
-        for (f,c,a) in ags:
+        # also aggregator
+        aex= self.agg_panel.get_aggregates()
+        final_cols= list(scols)
+        for (f,c,a) in aex:
             if f.upper()=="CUSTOM":
                 final_cols.append(c)
             else:
                 final_cols.append(f"{f}({c}) AS {a}")
+
         lines=[]
         lines.append("SELECT "+", ".join(final_cols))
         lines.append(self._build_bfs_from())
 
-        wfs=self.filter_panel.get_filters("WHERE")
-        if wfs:
-            conds=[f"{x[0]} {x[1]} {x[2]}" for x in wfs]
-            lines.append("WHERE "+" AND ".join(conds))
+        wh= self.filter_panel.get_filters("WHERE")
+        if wh:
+            conds= [f"{a[0]} {a[1]} {a[2]}" for a in wh]
+            lines.append("WHERE "+ " AND ".join(conds))
 
-        gb=self.group_panel.get_group_by()
+        gb= self.group_panel.get_group_by()
         if gb:
             lines.append("GROUP BY "+", ".join(gb))
 
-        hv=self.filter_panel.get_filters("HAVING")
+        hv= self.filter_panel.get_filters("HAVING")
         if hv:
-            conds=[f"{x[0]} {x[1]} {x[2]}" for x in hv]
-            lines.append("HAVING "+" AND ".join(conds))
+            conds= [f"{a[0]} {a[1]} {a[2]}" for a in hv]
+            lines.append("HAVING "+ " AND ".join(conds))
 
-        ob=self.sort_panel.get_order_bys()
+        ob= self.sort_panel.get_order_bys()
         if ob:
             lines.append("ORDER BY "+", ".join(ob))
-        lm=self.sort_panel.get_limit()
+
+        lm= self.sort_panel.get_limit()
         if lm is not None:
             lines.append(f"LIMIT {lm}")
-        off=self.sort_panel.get_offset()
+        off= self.sort_panel.get_offset()
         if off is not None:
             lines.append(f"OFFSET {off}")
-
         return "\n".join(lines)
 
-    def _generate_select_sql_only(self):
-        scols=self.get_selected_columns()
+    def _gen_select_noagg(self):
+        scols=[]
+        for k,it in self.canvas.table_items.items():
+            if hasattr(it,"get_selected_columns"):
+                scols.extend(it.get_selected_columns())
         if not scols:
             scols=["*"]
-        lines=[]
-        lines.append("SELECT "+", ".join(scols))
+        lines= []
+        lines.append("SELECT "+ ", ".join(scols))
         lines.append(self._build_bfs_from())
-        wfs=self.filter_panel.get_filters("WHERE")
-        if wfs:
-            conds=[f"{x[0]} {x[1]} {x[2]}" for x in wfs]
-            lines.append("WHERE "+" AND ".join(conds))
+        wh= self.filter_panel.get_filters("WHERE")
+        if wh:
+            conds= [f"{a[0]} {a[1]} {a[2]}" for a in wh]
+            lines.append("WHERE "+ " AND ".join(conds))
         return "\n".join(lines)
 
-    def _parse_target_info(self):
-        if not self.canvas.target_table_item:
-            return (None,None)
-        for ch in self.canvas.target_table_item.childItems():
-            if isinstance(ch,QGraphicsTextItem):
-                txt=ch.toPlainText().strip()
-                if txt.startswith("Target:"):
-                    raw=txt.replace("Target:","").strip()
-                    if "." in raw:
-                        parts=raw.split(".",1)
-                        return (parts[0].strip(), parts[1].strip())
-        return (None,None)
+    def _get_dml_target(self):
+        # find BFS item marked as is_dml_target
+        for k,v in self.canvas.table_items.items():
+            if hasattr(v,"is_dml_target") and v.is_dml_target:
+                # parse => alias.db.tbl
+                return k
+        return None
 
-    def _parse_mapped_columns(self):
+    def _parse_mappings(self):
+        # gather all mapping lines => source col => target col
         arr=[]
         for ml in self.canvas.mapping_lines:
-            arr.append((ml.source_col, ml.target_col))
+            sc= ml.source_col
+            tc= ml.target_col
+            arr.append((sc,tc))
         return arr
 
-    def _generate_insert(self):
-        dbName,tName=self._parse_target_info()
-        if not dbName or not tName:
-            return "-- No target => no INSERT"
-        mapped=self._parse_mapped_columns()
+    def _gen_insert(self):
+        t= self._get_dml_target()
+        if not t:
+            return "-- No BFS item marked as target => no INSERT"
+        mapped= self._parse_mappings()
         if not mapped:
-            return "-- No column mapping => no INSERT"
-        subSelect=self._generate_select_sql_only()
-        target_cols=[m[1] for m in mapped]
-        lines=[]
-        lines.append(f"INSERT INTO {dbName}.{tName} ({', '.join(target_cols)})")
-        lines.append(subSelect)
+            return "-- No col mappings => no INSERT"
+        # Build subselect from non-target BFS items => select the source columns
+        # We'll do a quick approach
+        # But let's do a simpler approach => _gen_select_noagg
+        # We'll remove references to target BFS item from BFS first
+        lines= []
+        # subselect
+        sub= self._gen_select_noagg()
+        # target columns
+        tCols= [m[1].split(".")[-1] for m in mapped]
+        alias= t.split(".")[0] # might not be needed
+        db,tbl= None,None
+        if "." in t:
+            parts= t.split(".")
+            if len(parts)>=3:
+                db= parts[1]
+                tbl= parts[2]
+        if not db or not tbl:
+            return "-- Could not parse target db.tbl => no INSERT"
+
+        lines.append(f"INSERT INTO {db}.{tbl} ({', '.join(tCols)})")
+        lines.append(sub)
         return "\n".join(lines)
 
-    def _generate_update(self):
-        dbName,tName=self._parse_target_info()
-        if not dbName or not tName:
-            return "-- No target => no UPDATE"
-        mapped=self._parse_mapped_columns()
+    def _gen_update(self):
+        t= self._get_dml_target()
+        if not t:
+            return "-- No BFS item is target => no UPDATE"
+        mapped= self._parse_mappings()
         if not mapped:
-            return "-- No column mapping => no UPDATE"
-        subSelect=self._generate_select_sql_only()
-        key_col="key"
+            return "-- No mapping => no UPDATE"
+        sub= self._gen_select_noagg()
+        key_col="id"
+        # parse => alias.db.tbl
+        parts= t.split(".")
+        if len(parts)<3:
+            return "-- cannot parse target => no UPDATE"
+        db= parts[1]
+        tbl= parts[2]
         sets=[]
         for (src,tgt) in mapped:
-            if tgt.lower()!=key_col:
+            if tgt.lower() != key_col.lower():
                 sets.append(f"{tgt}=src.{src}")
         lines=[]
-        lines.append(f"UPDATE {dbName}.{tName}")
+        lines.append(f"UPDATE {db}.{tbl}")
         lines.append(f"SET {', '.join(sets)}")
         lines.append("FROM (")
-        lines.append(subSelect)
+        lines.append(sub)
         lines.append(") AS src")
-        lines.append(f"WHERE {dbName}.{tName}.{key_col} = src.{key_col}")
+        lines.append(f"WHERE {db}.{tbl}.{key_col}=src.{key_col}")
         return "\n".join(lines)
 
-    def _generate_delete(self):
-        dbName,tName=self._parse_target_info()
-        if not dbName or not tName:
-            return "-- No target => no DELETE"
-        subSelect=self._generate_select_sql_only()
-        key_col="key"
+    def _gen_delete(self):
+        t= self._get_dml_target()
+        if not t:
+            return "-- No BFS item is target => no DELETE"
+        # We'll do "DELETE FROM db.tbl WHERE key in (subselect)"
+        sub= self._gen_select_noagg()
+        key_col="id"
+        parts= t.split(".")
+        if len(parts)<3:
+            return "-- cannot parse target => no DELETE"
+        db= parts[1]
+        tbl= parts[2]
         lines=[]
-        lines.append(f"DELETE FROM {dbName}.{tName}")
-        lines.append("WHERE "+f"{key_col} IN (")
-        lines.append(subSelect)
+        lines.append(f"DELETE FROM {db}.{tbl}")
+        lines.append(f"WHERE {key_col} IN (")
+        lines.append(sub)
         lines.append(")")
         return "\n".join(lines)
 
 ###############################################################################
-# 16) Main Window
+# The main window
 ###############################################################################
 class MainVQBWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Fully Integrated VQB - No Gaps")
+        self.setWindowTitle("Full VQB - BFS, DML, Expression Builder, etc.")
         self.resize(1200,800)
 
-        self.builder_tab=VisualQueryBuilderTab()
+        self.connections={}
+        self.linked_map={}
+        self.builder_tab= VisualQueryBuilderTab(
+            multi_connections=self.connections,
+            linked_map=self.linked_map
+        )
         self.setCentralWidget(self.builder_tab)
         self.init_toolbar()
 
     def init_toolbar(self):
-        tb=self.addToolBar("Main Toolbar")
-        fit_act=QAction("Fit to View",self)
-        fit_act.triggered.connect(self.on_fit_view)
-        tb.addAction(fit_act)
+        tb= self.addToolBar("MainToolBar")
+        conn_a= QAction("Connections", self)
+        conn_a.triggered.connect(self.on_manage_conn)
+        tb.addAction(conn_a)
 
-        layout_act=QAction("Auto-Layout",self)
-        layout_act.triggered.connect(self.on_auto_layout)
-        tb.addAction(layout_act)
+        lnk_a= QAction("Linked Server Config", self)
+        lnk_a.triggered.connect(self.on_link_cfg)
+        tb.addAction(lnk_a)
 
-        map_act=QAction("Demo Map (srcCol1->colA)",self)
-        map_act.triggered.connect(self.demo_map)
-        tb.addAction(map_act)
+        fit_a= QAction("Fit to View", self)
+        fit_a.triggered.connect(self.on_fit_view)
+        tb.addAction(fit_a)
+
+        layout_a= QAction("Auto-Layout BFS", self)
+        layout_a.triggered.connect(self.on_auto_layout)
+        tb.addAction(layout_a)
+
+        # Demo BFS lines are not needed
+
+    def on_manage_conn(self):
+        d= MultiODBCConnectDialog(self.connections, self)
+        if d.exec_()== QDialog.Accepted:
+            self.connections= d.get_connections()
+            self.builder_tab.set_connections(self.connections)
+
+    def on_link_cfg(self):
+        d= LinkedServerConfigDialog(self.linked_map, self)
+        if d.exec_()== QDialog.Accepted:
+            self.linked_map= d.get_map()
+            self.builder_tab.set_federation_map(self.linked_map)
+            QMessageBox.information(self,"Linked Config","Cross-DB rewriting is updated.")
 
     def on_fit_view(self):
-        sc=self.builder_tab.canvas.scene_
-        self.builder_tab.canvas.fitInView(sc.itemsBoundingRect(),Qt.KeepAspectRatio)
+        sc= self.builder_tab.canvas.scene_
+        self.builder_tab.canvas.fitInView(sc.itemsBoundingRect(), Qt.KeepAspectRatio)
 
     def on_auto_layout(self):
-        items=list(self.builder_tab.canvas.table_items.values())
+        items= list(self.builder_tab.canvas.table_items.values())
         col_count=3
         xsp=250
         ysp=180
-        for i,itm in enumerate(items):
-            row=i//col_count
-            col=i%col_count
-            itm.setPos(col*xsp,row*ysp)
-        for jl in self.builder_tab.canvas.join_lines:
-            jl.update_line()
+        for i,it in enumerate(items):
+            row= i//col_count
+            col= i%col_count
+            it.setPos(col*xsp, row*ysp)
+        # update lines
+        # BFS lines
+        for ln in self.builder_tab.canvas.scene_.items():
+            if isinstance(ln, JoinLine):
+                ln.update_line()
+            if isinstance(ln, MappingLine):
+                ln.update_pos()
 
-    def demo_map(self):
-        cv=self.builder_tab.canvas
-        if not cv.complete_query_item or not cv.target_table_item:
-            QMessageBox.information(self,"No placeholders","Switch to DML mode first.")
-            return
-        left_txt=None
-        for ch in cv.complete_query_item.childItems():
-            if isinstance(ch,QGraphicsTextItem):
-                if ch.toPlainText().strip().lower()=="srccol1":
-                    left_txt=ch
-                    break
-        right_txt=None
-        for ch in cv.target_table_item.childItems():
-            if isinstance(ch,QGraphicsTextItem):
-                if ch.toPlainText().strip().lower()=="cola":
-                    right_txt=ch
-                    break
-        if not left_txt or not right_txt:
-            QMessageBox.information(self,"Not found","srcCol1 or colA not found in placeholders.")
-            return
-        cv.create_mapping_line(left_txt,right_txt)
 
 def main():
-    app=QApplication(sys.argv)
+    app= QApplication(sys.argv)
     apply_fusion_style()
-    w=MainVQBWindow()
+    w= MainVQBWindow()
     w.show()
     sys.exit(app.exec_())
 
