@@ -1,0 +1,384 @@
+-------------------------------------------------------------------------------
+-- 1) BUSINESS_GROUPS
+-------------------------------------------------------------------------------
+CREATE TABLE dbo.BUSINESS_GROUPS (
+    GROUP_NAME       VARCHAR(100) NOT NULL,
+    DESCRIPTION      VARCHAR(500),
+    EMAIL            VARCHAR(200),
+    CONSTRAINT PK_BUSINESS_GROUPS
+        PRIMARY KEY (GROUP_NAME)
+);
+GO
+
+-------------------------------------------------------------------------------
+-- 2) USERS
+-- References BUSINESS_GROUPS (USER_GROUP -> GROUP_NAME)
+-------------------------------------------------------------------------------
+CREATE TABLE dbo.USERS (
+    USER_ID          INT IDENTITY(1,1) NOT NULL,
+    USERNAME         VARCHAR(100) NOT NULL UNIQUE,
+    PASSWORD         VARCHAR(100) NOT NULL,
+    USER_GROUP       VARCHAR(100) NOT NULL,
+    CONSTRAINT PK_USERS
+        PRIMARY KEY (USER_ID),
+    CONSTRAINT FK_USERS_BG
+        FOREIGN KEY (USER_GROUP)
+        REFERENCES dbo.BUSINESS_GROUPS(GROUP_NAME)
+);
+GO
+
+-------------------------------------------------------------------------------
+-- 3) GROUP_PERMISSIONS
+-- References BUSINESS_GROUPS (GROUP_NAME -> GROUP_NAME)
+-------------------------------------------------------------------------------
+CREATE TABLE dbo.GROUP_PERMISSIONS (
+    GROUP_NAME    VARCHAR(100) NOT NULL,
+    TARGET_TABLE  VARCHAR(100) NOT NULL,
+    CONSTRAINT PK_GROUP_PERMISSIONS
+        PRIMARY KEY (GROUP_NAME, TARGET_TABLE),
+    CONSTRAINT FK_GPERM_BG
+        FOREIGN KEY (GROUP_NAME)
+        REFERENCES dbo.BUSINESS_GROUPS(GROUP_NAME)
+        ON DELETE CASCADE
+);
+GO
+
+-------------------------------------------------------------------------------
+-- 4) BRM_RULE_TYPES
+-------------------------------------------------------------------------------
+CREATE TABLE dbo.BRM_RULE_TYPES (
+    RULE_TYPE_ID    INT NOT NULL,
+    RULE_TYPE_NAME  VARCHAR(100) NOT NULL,
+    CONSTRAINT PK_BRM_RULE_TYPES
+        PRIMARY KEY (RULE_TYPE_ID),
+    CONSTRAINT UQ_BRM_RULE_TYPES_NAME
+        UNIQUE (RULE_TYPE_NAME)
+);
+GO
+
+-------------------------------------------------------------------------------
+-- 5) BRM_RULE_GROUPS
+-------------------------------------------------------------------------------
+CREATE TABLE dbo.BRM_RULE_GROUPS (
+    GROUP_ID    INT IDENTITY(1,1) NOT NULL,
+    GROUP_NAME  VARCHAR(200) NOT NULL,
+    DESCRIPTION VARCHAR(500),
+    CONSTRAINT PK_BRM_RULE_GROUPS
+        PRIMARY KEY (GROUP_ID),
+    CONSTRAINT UQ_BRM_RULE_GROUPS_NAME
+        UNIQUE (GROUP_NAME)
+);
+GO
+
+-------------------------------------------------------------------------------
+-- 6) BRM_RULES
+-- References:
+--   - BRM_RULE_GROUPS(GROUP_ID)
+--   - BRM_RULES(RULE_ID) for parent
+--   - BRM_RULE_TYPES(RULE_TYPE_ID)
+--   - BUSINESS_GROUPS(GROUP_NAME) for OWNER_GROUP
+-------------------------------------------------------------------------------
+CREATE TABLE dbo.BRM_RULES (
+    RULE_ID               INT IDENTITY(1,1) NOT NULL,
+    GROUP_ID              INT NULL,
+    PARENT_RULE_ID        INT NULL,
+    RULE_TYPE_ID          INT NOT NULL,
+    RULE_NAME             VARCHAR(200) NOT NULL,
+    RULE_SQL              VARCHAR(MAX) NOT NULL,
+    EFFECTIVE_START_DATE  DATETIME2 NOT NULL,
+    EFFECTIVE_END_DATE    DATETIME2 NULL,
+    STATUS                VARCHAR(8) NOT NULL,
+    VERSION               INT NOT NULL DEFAULT 1,
+    CREATED_BY            VARCHAR(100) NOT NULL,
+    DESCRIPTION           VARCHAR(MAX),
+    OPERATION_TYPE        VARCHAR(20),
+    BUSINESS_JUSTIFICATION VARCHAR(MAX),
+    CREATED_TIMESTAMP     DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    UPDATED_BY            VARCHAR(100),
+    OWNER_GROUP           VARCHAR(100) NOT NULL,
+    CLUSTER_NAME          VARCHAR(100),
+    APPROVAL_STATUS       VARCHAR(50) NOT NULL DEFAULT 'DRAFT',
+    IS_GLOBAL             BIT NOT NULL DEFAULT 0,
+    CRITICAL_RULE         BIT NOT NULL DEFAULT 0,
+    CRITICAL_SCOPE        VARCHAR(50) NOT NULL DEFAULT 'NONE',
+    CDC_TYPE              VARCHAR(50) NOT NULL DEFAULT 'NONE',
+
+    CONSTRAINT PK_BRM_RULES
+        PRIMARY KEY (RULE_ID),
+
+    -- Unique across (OWNER_GROUP, RULE_NAME)
+    CONSTRAINT UQ_BRM_RULES_OWNERNAME
+        UNIQUE (OWNER_GROUP, RULE_NAME),
+
+    -- Check constraint on STATUS
+    CONSTRAINT CK_BRM_RULES_STATUS
+        CHECK (STATUS IN ('ACTIVE','INACTIVE')),
+
+    -- Foreign keys
+    CONSTRAINT FK_BRM_RULES_RULEGROUPS
+        FOREIGN KEY (GROUP_ID)
+        REFERENCES dbo.BRM_RULE_GROUPS(GROUP_ID)
+        ON DELETE SET NULL,
+
+    CONSTRAINT FK_BRM_RULES_PARENT
+        FOREIGN KEY (PARENT_RULE_ID)
+        REFERENCES dbo.BRM_RULES(RULE_ID)
+        ON DELETE CASCADE,
+
+    CONSTRAINT FK_BRM_RULES_RTYPE
+        FOREIGN KEY (RULE_TYPE_ID)
+        REFERENCES dbo.BRM_RULE_TYPES(RULE_TYPE_ID),
+
+    CONSTRAINT FK_BRM_RULES_OWNERGROUP
+        FOREIGN KEY (OWNER_GROUP)
+        REFERENCES dbo.BUSINESS_GROUPS(GROUP_NAME)
+);
+GO
+
+-------------------------------------------------------------------------------
+-- 7) BRM_RULE_TABLE_DEPENDENCIES
+-- References BRM_RULES(RULE_ID)
+-------------------------------------------------------------------------------
+CREATE TABLE dbo.BRM_RULE_TABLE_DEPENDENCIES (
+    DEPENDENCY_ID   INT IDENTITY(1,1) NOT NULL,
+    RULE_ID         INT NOT NULL,
+    DATABASE_NAME   VARCHAR(200) NOT NULL,
+    TABLE_NAME      VARCHAR(200) NOT NULL,
+    COLUMN_NAME     VARCHAR(200) NOT NULL,
+
+    CONSTRAINT PK_BRM_RULE_TABLE_DEP
+        PRIMARY KEY (DEPENDENCY_ID),
+
+    CONSTRAINT FK_BRM_RTD_RULES
+        FOREIGN KEY (RULE_ID)
+        REFERENCES dbo.BRM_RULES(RULE_ID)
+        ON DELETE CASCADE
+);
+GO
+
+-------------------------------------------------------------------------------
+-- 8) BRM_RULE_LINEAGE
+-- References BRM_RULES(RULE_ID)
+-------------------------------------------------------------------------------
+CREATE TABLE dbo.BRM_RULE_LINEAGE (
+    LINEAGE_ID            INT IDENTITY(1,1) NOT NULL,
+    RULE_ID               INT NOT NULL,
+    SOURCE_INFO           VARCHAR(MAX),
+    TARGET_INFO           VARCHAR(MAX),
+    TRANSFORMATION_DETAILS VARCHAR(MAX),
+    CREATED_TIMESTAMP     DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT PK_BRM_RULE_LINEAGE
+        PRIMARY KEY (LINEAGE_ID),
+
+    CONSTRAINT FK_BRM_RULE_LINEAGE_RULES
+        FOREIGN KEY (RULE_ID)
+        REFERENCES dbo.BRM_RULES(RULE_ID)
+        ON DELETE CASCADE
+);
+GO
+
+-------------------------------------------------------------------------------
+-- 9) BRM_COLUMN_MAPPING
+-- References BRM_RULES(RULE_ID) for both RULE_ID and SOURCE_RULE_ID
+-------------------------------------------------------------------------------
+CREATE TABLE dbo.BRM_COLUMN_MAPPING (
+    MAPPING_ID          INT IDENTITY(1,1) NOT NULL,
+    RULE_ID             INT NOT NULL,
+    SOURCE_RULE_ID      INT NOT NULL,
+    SOURCE_COLUMN_NAME  VARCHAR(200) NOT NULL,
+    TARGET_COLUMN_NAME  VARCHAR(200) NOT NULL,
+
+    CONSTRAINT PK_BRM_COLUMN_MAPPING
+        PRIMARY KEY (MAPPING_ID),
+
+    CONSTRAINT FK_BRM_CM_RULES1
+        FOREIGN KEY (RULE_ID)
+        REFERENCES dbo.BRM_RULES(RULE_ID)
+        ON DELETE CASCADE,
+
+    CONSTRAINT FK_BRM_CM_RULES2
+        FOREIGN KEY (SOURCE_RULE_ID)
+        REFERENCES dbo.BRM_RULES(RULE_ID)
+        ON DELETE CASCADE
+);
+GO
+
+-------------------------------------------------------------------------------
+-- 10) BRM_AUDIT_LOG
+-------------------------------------------------------------------------------
+CREATE TABLE dbo.BRM_AUDIT_LOG (
+    AUDIT_ID        INT IDENTITY(1,1) NOT NULL,
+    ACTION          VARCHAR(50) NOT NULL,
+    TABLE_NAME      VARCHAR(100) NOT NULL,
+    RECORD_ID       VARCHAR(50) NOT NULL,
+    ACTION_BY       VARCHAR(100) NOT NULL,
+    OLD_DATA        VARCHAR(MAX),
+    NEW_DATA        VARCHAR(MAX),
+    ACTION_TIMESTAMP DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT PK_BRM_AUDIT_LOG
+        PRIMARY KEY (AUDIT_ID)
+);
+GO
+
+-------------------------------------------------------------------------------
+-- 11) BUSINESS_GROUP_APPROVERS
+-- References BUSINESS_GROUPS
+-------------------------------------------------------------------------------
+CREATE TABLE dbo.BUSINESS_GROUP_APPROVERS (
+    APPROVER_ID INT IDENTITY(1,1) NOT NULL,
+    GROUP_NAME  VARCHAR(100) NOT NULL,
+    USERNAME    VARCHAR(100) NOT NULL,
+
+    CONSTRAINT PK_BUSINESS_GROUP_APPROVERS
+        PRIMARY KEY (APPROVER_ID),
+
+    CONSTRAINT FK_BG_APPROVERS_BG
+        FOREIGN KEY (GROUP_NAME)
+        REFERENCES dbo.BUSINESS_GROUPS(GROUP_NAME)
+        ON DELETE CASCADE
+);
+GO
+
+-------------------------------------------------------------------------------
+-- 12) BRM_RULE_APPROVALS
+-- References BRM_RULES(RULE_ID) and BUSINESS_GROUPS(GROUP_NAME)
+-------------------------------------------------------------------------------
+CREATE TABLE dbo.BRM_RULE_APPROVALS (
+    RULE_ID         INT NOT NULL,
+    GROUP_NAME      VARCHAR(100) NOT NULL,
+    USERNAME        VARCHAR(100) NOT NULL,
+    APPROVED_FLAG   BIT NOT NULL DEFAULT 0,
+    APPROVED_TIMESTAMP DATETIME2 NULL,
+    APPROVAL_STAGE  INT NOT NULL DEFAULT 1,
+
+    CONSTRAINT PK_BRM_RULE_APPROVALS
+        PRIMARY KEY (RULE_ID, GROUP_NAME, USERNAME),
+
+    CONSTRAINT FK_BRM_RULE_APPROVALS_RULES
+        FOREIGN KEY (RULE_ID)
+        REFERENCES dbo.BRM_RULES(RULE_ID)
+        ON DELETE CASCADE,
+
+    CONSTRAINT FK_BRM_RULE_APPROVALS_BG
+        FOREIGN KEY (GROUP_NAME)
+        REFERENCES dbo.BUSINESS_GROUPS(GROUP_NAME)
+        ON DELETE CASCADE
+);
+GO
+
+-------------------------------------------------------------------------------
+-- 13) BRM_GROUP_BACKUPS
+-- References BUSINESS_GROUPS
+-------------------------------------------------------------------------------
+CREATE TABLE dbo.BRM_GROUP_BACKUPS (
+    BACKUP_ID       INT IDENTITY(1,1) NOT NULL,
+    GROUP_NAME      VARCHAR(100) NOT NULL,
+    BACKUP_TIMESTAMP DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    BACKUP_VERSION  INT NOT NULL,
+    BACKUP_JSON     VARCHAR(MAX) NOT NULL,
+
+    CONSTRAINT PK_BRM_GROUP_BACKUPS
+        PRIMARY KEY (BACKUP_ID),
+
+    CONSTRAINT FK_BRM_GRP_BK_BG
+        FOREIGN KEY (GROUP_NAME)
+        REFERENCES dbo.BUSINESS_GROUPS(GROUP_NAME)
+        ON DELETE CASCADE
+);
+GO
+
+-------------------------------------------------------------------------------
+-- 14) BRM_CUSTOM_RULE_GROUPS
+-------------------------------------------------------------------------------
+CREATE TABLE dbo.BRM_CUSTOM_RULE_GROUPS (
+    CUSTOM_GROUP_ID        INT IDENTITY(1,1) NOT NULL,
+    CUSTOM_GROUP_NAME      VARCHAR(200) NOT NULL,
+    OWNER_BUSINESS_GROUP   VARCHAR(100) NOT NULL,
+    CREATED_BY             VARCHAR(100) NOT NULL,
+    CREATED_TIMESTAMP      DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT PK_BRM_CUSTOM_RULE_GROUPS
+        PRIMARY KEY (CUSTOM_GROUP_ID),
+
+    CONSTRAINT UQ_BRM_CUSTOM_RULE_GROUPS_NAME
+        UNIQUE (CUSTOM_GROUP_NAME)
+);
+GO
+
+-- If you want a FK from OWNER_BUSINESS_GROUP -> BUSINESS_GROUPS:
+ALTER TABLE dbo.BRM_CUSTOM_RULE_GROUPS
+ADD CONSTRAINT FK_BRM_CUSTOM_RULE_GROUPS_BG
+    FOREIGN KEY (OWNER_BUSINESS_GROUP)
+    REFERENCES dbo.BUSINESS_GROUPS(GROUP_NAME);
+GO
+
+-------------------------------------------------------------------------------
+-- 15) BRM_CUSTOM_GROUP_MEMBERS
+-- References BRM_CUSTOM_RULE_GROUPS(CUSTOM_GROUP_ID) and BRM_RULES(RULE_ID)
+-------------------------------------------------------------------------------
+CREATE TABLE dbo.BRM_CUSTOM_GROUP_MEMBERS (
+    CUSTOM_GROUP_ID INT NOT NULL,
+    RULE_ID         INT NOT NULL,
+
+    CONSTRAINT PK_BRM_CUSTOM_GROUP_MEMBERS
+        PRIMARY KEY (CUSTOM_GROUP_ID,RULE_ID),
+
+    CONSTRAINT FK_BRM_CGM_CG
+        FOREIGN KEY (CUSTOM_GROUP_ID)
+        REFERENCES dbo.BRM_CUSTOM_RULE_GROUPS(CUSTOM_GROUP_ID)
+        ON DELETE CASCADE,
+
+    CONSTRAINT FK_BRM_CGM_RULES
+        FOREIGN KEY (RULE_ID)
+        REFERENCES dbo.BRM_RULES(RULE_ID)
+        ON DELETE CASCADE
+);
+GO
+
+-------------------------------------------------------------------------------
+-- 16) BRM_CUSTOM_GROUP_BACKUPS
+-- References BRM_CUSTOM_RULE_GROUPS(CUSTOM_GROUP_ID)
+-------------------------------------------------------------------------------
+CREATE TABLE dbo.BRM_CUSTOM_GROUP_BACKUPS (
+    BACKUP_ID          INT IDENTITY(1,1) NOT NULL,
+    CUSTOM_GROUP_ID    INT NOT NULL,
+    BACKUP_TIMESTAMP   DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    BACKUP_VERSION     INT NOT NULL,
+    BACKUP_JSON        VARCHAR(MAX) NOT NULL,
+
+    CONSTRAINT PK_BRM_CUSTOM_GROUP_BACKUPS
+        PRIMARY KEY (BACKUP_ID),
+
+    CONSTRAINT FK_BRM_CG_BK_CG
+        FOREIGN KEY (CUSTOM_GROUP_ID)
+        REFERENCES dbo.BRM_CUSTOM_RULE_GROUPS(CUSTOM_GROUP_ID)
+        ON DELETE CASCADE
+);
+GO
+
+-------------------------------------------------------------------------------
+-- 17) BRM_GLOBAL_CRITICAL_LINKS
+-- References BRM_RULES(RULE_ID)
+-------------------------------------------------------------------------------
+CREATE TABLE dbo.BRM_GLOBAL_CRITICAL_LINKS (
+    LINK_ID         INT IDENTITY(1,1) NOT NULL,
+    GCR_RULE_ID     INT NOT NULL,
+    TARGET_RULE_ID  INT NULL,
+    TARGET_GROUP_ID INT NULL,
+
+    CONSTRAINT PK_BRM_GLOBAL_CRITICAL_LINKS
+        PRIMARY KEY (LINK_ID),
+
+    CONSTRAINT FK_BRM_GCL_GCRRULE
+        FOREIGN KEY (GCR_RULE_ID)
+        REFERENCES dbo.BRM_RULES(RULE_ID)
+        ON DELETE CASCADE,
+
+    CONSTRAINT FK_BRM_GCL_TGTRULE
+        FOREIGN KEY (TARGET_RULE_ID)
+        REFERENCES dbo.BRM_RULES(RULE_ID)
+        ON DELETE CASCADE
+);
+GO
